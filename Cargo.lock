@@ -1910,12 +1910,11 @@ checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 [[package]]
 name = "noren"
 version = "0.1.0"
-source = "git+https://github.com/JordanHendl/noren#f44bcf396fb91fe4ff8205e445c43226fdf44081"
+source = "git+https://github.com/JordanHendl/noren#1c3a4e8b3b184d709866a4a81f11ead471915686"
 dependencies = [
  "bincode",
  "bytemuck",
  "dashi",
- "eframe",
  "fontdue",
  "glam",
  "gltf",

@@ -1,0 +1,8 @@
+{
+  "geometry": "geometry.rdb",
+  "imagery": "imagery.rdb",
+  "models": "models.json",
+  "materials": "materials.json",
+  "render_passes": "render_passes.json",
+  "shaders": "shaders.rdb"
+}

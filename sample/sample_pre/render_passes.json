@@ -1,0 +1,38 @@
+{
+  "render_passes": {
+    "render_pass/default": {
+      "debug_name": "Sample Quad Render Pass",
+      "viewport": {
+        "area": {
+          "x": 0.0,
+          "y": 0.0,
+          "w": 800.0,
+          "h": 600.0
+        },
+        "scissor": {
+          "x": 0,
+          "y": 0,
+          "w": 800,
+          "h": 600
+        },
+        "min_depth": 0.0,
+        "max_depth": 1.0
+      },
+      "subpasses": [
+        {
+          "color_attachments": [
+            {
+              "format": "RGBA8",
+              "samples": "S1",
+              "load_op": "Clear",
+              "store_op": "Store",
+              "stencil_load_op": "DontCare",
+              "stencil_store_op": "DontCare"
+            }
+          ],
+          "subpass_dependencies": []
+        }
+      ]
+    }
+  }
+}

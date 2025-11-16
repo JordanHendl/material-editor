@@ -1,0 +1,194 @@
+{
+  "textures": {
+    "texture/quad_diffuse": {
+      "image": "imagery/tulips",
+      "name": "Quad Diffuse"
+    },
+    "texture/quad_overlay": {
+      "image": "imagery/peppers",
+      "name": "Quad Overlay"
+    }
+  },
+  "materials": {
+    "material/quad": {
+      "name": "Quad Material",
+      "textures": [],
+      "shader": "shader/default"
+    },
+    "material/multi_bind": {
+      "name": "Multi Bind Quad",
+      "textures": [
+        "texture/quad_diffuse",
+        "texture/quad_overlay"
+      ],
+      "shader": "shader/multi_bind"
+    },
+    "material/bind_table": {
+      "name": "Bind Table Quad",
+      "textures": [
+        "texture/quad_overlay"
+      ],
+      "shader": "shader/bind_table"
+    }
+  },
+  "meshes": {},
+  "models": {},
+  "shaders": {
+    "shader/default": {
+      "name": "Default Shader",
+      "vertex": "shader/quad.vert",
+      "fragment": "shader/quad.frag",
+      "geometry": null,
+      "tessellation_control": null,
+      "tessellation_evaluation": null,
+      "bind_group_layouts": [],
+      "bind_table_layouts": [],
+      "subpass": 0,
+      "render_pass": "render_pass/default"
+    },
+    "shader/multi_bind": {
+      "name": "Multi Bind Shader",
+      "vertex": "shader/multi_bind.vert",
+      "fragment": "shader/multi_bind.frag",
+      "geometry": null,
+      "tessellation_control": null,
+      "tessellation_evaluation": null,
+      "bind_group_layouts": [
+        {
+          "debug_name": "camera_and_view",
+          "shaders": [
+            {
+              "stage": "Vertex",
+              "variables": [
+                {
+                  "var_type": "Uniform",
+                  "binding": 0,
+                  "count": 1
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "debug_name": "scene_data",
+          "shaders": [
+            {
+              "stage": "Vertex",
+              "variables": [
+                {
+                  "var_type": "Storage",
+                  "binding": 0,
+                  "count": 1
+                }
+              ]
+            },
+            {
+              "stage": "Fragment",
+              "variables": [
+                {
+                  "var_type": "Storage",
+                  "binding": 1,
+                  "count": 1
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "debug_name": "material_layers",
+          "shaders": [
+            {
+              "stage": "Fragment",
+              "variables": [
+                {
+                  "var_type": "SampledImage",
+                  "binding": 0,
+                  "count": 4
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "bind_table_layouts": [
+        {
+          "debug_name": "bindless_materials",
+          "shaders": [
+            {
+              "stage": "Fragment",
+              "variables": [
+                {
+                  "var_type": "SampledImage",
+                  "binding": 0,
+                  "count": 64
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "subpass": 0,
+      "render_pass": "render_pass/default"
+    },
+    "shader/bind_table": {
+      "name": "Bind Table Shader",
+      "vertex": "shader/bind_table.vert",
+      "fragment": "shader/bind_table.frag",
+      "geometry": null,
+      "tessellation_control": null,
+      "tessellation_evaluation": null,
+      "bind_group_layouts": [
+        {
+          "debug_name": "post_settings",
+          "shaders": [
+            {
+              "stage": "Vertex",
+              "variables": [
+                {
+                  "var_type": "DynamicUniform",
+                  "binding": 0,
+                  "count": 1
+                }
+              ]
+            },
+            {
+              "stage": "Fragment",
+              "variables": [
+                {
+                  "var_type": "Uniform",
+                  "binding": 1,
+                  "count": 1
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "bind_table_layouts": [
+        {
+          "debug_name": "bindless_lookup",
+          "shaders": [
+            {
+              "stage": "Fragment",
+              "variables": [
+                {
+                  "var_type": "SampledImage",
+                  "binding": 0,
+                  "count": 32
+                },
+                {
+                  "var_type": "Storage",
+                  "binding": 1,
+                  "count": 1
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "subpass": 0,
+      "render_pass": "render_pass/default"
+    }
+  },
+  "render_passes": {}
+}

@@ -1,0 +1,71 @@
+{
+  "output": {
+    "directory": "../db",
+    "layout_file": "layout.json",
+    "layout": {
+      "geometry": "geometry.rdb",
+      "imagery": "imagery.rdb",
+      "models": "models.json",
+      "shaders": "shaders.rdb"
+    }
+  },
+  "geometry": [
+    {
+      "entry": "geometry/quad",
+      "file": "gltf/quad.gltf",
+      "mesh": "Quad",
+      "primitive": 0
+    }
+  ],
+  "imagery": [
+    {
+      "entry": "imagery/tulips",
+      "file": "imagery/tulips.png"
+    },
+    {
+      "entry": "imagery/peppers",
+      "file": "imagery/peppers.png"
+    }
+  ],
+  "models": [
+    {
+      "name": "quad",
+      "geometry": "geometry/quad",
+      "textures": [
+        "imagery/tulips"
+      ]
+    }
+  ],
+  "shaders": [
+    {
+      "entry": "shader/quad.vert",
+      "stage": "vertex",
+      "file": "shaders/quad.vert"
+    },
+    {
+      "entry": "shader/quad.frag",
+      "stage": "fragment",
+      "file": "shaders/quad.frag"
+    },
+    {
+      "entry": "shader/multi_bind.vert",
+      "stage": "vertex",
+      "file": "shaders/multi_bind.vert"
+    },
+    {
+      "entry": "shader/multi_bind.frag",
+      "stage": "fragment",
+      "file": "shaders/multi_bind.frag"
+    },
+    {
+      "entry": "shader/bind_table.vert",
+      "stage": "vertex",
+      "file": "shaders/bind_table.vert"
+    },
+    {
+      "entry": "shader/bind_table.frag",
+      "stage": "fragment",
+      "file": "shaders/bind_table.frag"
+    }
+  ]
+}
