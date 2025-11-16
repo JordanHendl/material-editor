@@ -1,0 +1,24 @@
+[package]
+name = "material_editor"
+version = "0.1.0"
+edition = "2024"
+
+[profile.dev.package."*"]
+debug = false
+
+[dependencies]
+gltf = "1.4.1"  # For reading glTF files
+glam = "0.24.0"  # For vector math (Vec2 and Vec3)
+image = "0.24"
+dashi = {git = "https://github.com/JordanHendl/dashi", features = ["dashi-serde"]}
+noren = {git = "https://github.com/JordanHendl/noren"}
+unzip3 = "1.0.0"
+fontdue = "0.9.2"
+memmap2 = "0.9"
+bytemuck = { version = "1.17", features = ["derive"] }
+bincode = "1"
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow", "wgpu", "wayland", "x11"] }
+winit = { version = "0.26" }
+shaderc = "0.8"
+serde = {version = "1.0.210", features = ["derive"]}
+serde_json = "1.0.128"
