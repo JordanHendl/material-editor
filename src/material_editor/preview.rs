@@ -311,40 +311,46 @@ impl PreviewRenderer {
         let slots = texture_binding_slots(&layout);
         let mut handles = Vec::with_capacity(slots.len());
         for (index, slot) in slots.iter().enumerate() {
-            let value = material
-                .textures
-                .get(index)
-                .map(|entry| entry.trim())
-                .unwrap_or("");
-            if value.is_empty() {
-                if matches!(slot.kind, TextureBindingKind::BindGroup { .. }) {
-                    warnings.push(format!(
-                        "{} is unassigned; preview will use fallback colors",
-                        Self::describe_slot(slot)
-                    ));
+            let binding = material.textures.get(index).cloned().unwrap_or_default();
+            match slot.kind {
+                TextureBindingKind::BindGroup { .. } => {
+                    let Some(value) = binding.as_texture() else {
+                        warnings.push(format!(
+                            "{} is unassigned; preview will use fallback colors",
+                            Self::describe_slot(slot)
+                        ));
+                        handles.push(None);
+                        continue;
+                    };
+                    let Some(GraphTexture { resource }) = state.graph.textures.get(value) else {
+                        warnings.push(format!("Texture '{value}' is missing"));
+                        handles.push(None);
+                        continue;
+                    };
+                    let image_entry = resource.data.image.clone();
+                    if image_entry.is_empty() {
+                        warnings.push(format!("Texture '{value}' does not reference imagery"));
+                        handles.push(None);
+                        continue;
+                    }
+                    if let Some(texture) = self.assets.texture(&image_entry) {
+                        handles.push(Some(texture));
+                    } else {
+                        warnings.push(format!(
+                            "Failed to load imagery '{}' for texture '{}'",
+                            image_entry, value
+                        ));
+                        handles.push(None);
+                    }
                 }
-                handles.push(None);
-                continue;
-            }
-            let Some(GraphTexture { resource }) = state.graph.textures.get(value) else {
-                warnings.push(format!("Texture '{value}' is missing"));
-                handles.push(None);
-                continue;
-            };
-            let image_entry = resource.data.image.clone();
-            if image_entry.is_empty() {
-                warnings.push(format!("Texture '{value}' does not reference imagery"));
-                handles.push(None);
-                continue;
-            }
-            if let Some(texture) = self.assets.texture(&image_entry) {
-                handles.push(Some(texture));
-            } else {
-                warnings.push(format!(
-                    "Failed to load imagery '{}' for texture '{}'",
-                    image_entry, value
-                ));
-                handles.push(None);
+                TextureBindingKind::BindTable { .. } => {
+                    if let Some(reference) = binding.as_bindless().or_else(|| binding.value()) {
+                        if !state.graph.textures.contains_key(reference) {
+                            warnings.push(format!("Bindless reference '{}' is missing", reference));
+                        }
+                    }
+                    handles.push(None);
+                }
             }
         }
         Some((slots, handles))
