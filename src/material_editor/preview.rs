@@ -218,17 +218,22 @@ impl PreviewRenderer {
         }
         self.assets.ensure_shaders(state.root(), &state.layout);
 
-        let (_slots, textures) = match self.resolve_textures(material, state, &mut warnings) {
+        let resolved = match self.resolve_textures(material, state, &mut warnings) {
             Some(result) => result,
             None => {
                 warnings.push(
                     "Shader information unavailable; preview will use fallback colors".into(),
                 );
-                (Vec::new(), Vec::new())
+                ResolvedTextureBindings::default()
             }
         };
 
-        let texture = textures.iter().flatten().next().cloned();
+        let texture = resolved
+            .descriptor_bindings
+            .iter()
+            .flatten()
+            .next()
+            .cloned();
         if texture.is_none() {
             warnings.push("No previewable texture bindings; using fallback colors".to_string());
         }
@@ -304,12 +309,13 @@ impl PreviewRenderer {
         material: &MaterialEditorMaterial,
         state: &MaterialEditorProjectState,
         warnings: &mut Vec<String>,
-    ) -> Option<(Vec<TextureBindingSlot>, Vec<Option<PreviewTextureHandle>>)> {
+    ) -> Option<ResolvedTextureBindings> {
         let shader_id = material.shader.as_ref()?;
         let shader = state.graph.shaders.get(shader_id)?;
         let layout: GraphicsShaderLayout = shader.resource.data.clone().into();
         let slots = texture_binding_slots(&layout);
         let mut handles = Vec::with_capacity(slots.len());
+        let mut bindless_ids = Vec::new();
         for (index, slot) in slots.iter().enumerate() {
             let binding = material.textures.get(index).cloned().unwrap_or_default();
             match slot.kind {
@@ -344,16 +350,34 @@ impl PreviewRenderer {
                     }
                 }
                 TextureBindingKind::BindTable { .. } => {
-                    if let Some(reference) = binding.as_bindless().or_else(|| binding.value()) {
-                        if !state.graph.textures.contains_key(reference) {
-                            warnings.push(format!("Bindless reference '{}' is missing", reference));
-                        }
-                    }
+                    let numeric_id = binding
+                        .as_bindless()
+                        .or_else(|| binding.value())
+                        .map(|reference| {
+                            if !state.graph.textures.contains_key(reference) {
+                                warnings
+                                    .push(format!("Bindless reference '{}' is missing", reference));
+                            }
+
+                            reference.parse::<u32>().unwrap_or_else(|_| {
+                                warnings.push(format!(
+                                    "Bindless reference '{}' is not a numeric ID; using 0",
+                                    reference
+                                ));
+                                0
+                            })
+                        })
+                        .unwrap_or_default();
+                    bindless_ids.push(numeric_id);
                     handles.push(None);
                 }
             }
         }
-        Some((slots, handles))
+        Some(ResolvedTextureBindings {
+            slots,
+            descriptor_bindings: handles,
+            bindless_ids,
+        })
     }
 
     fn describe_slot(slot: &TextureBindingSlot) -> String {
@@ -375,6 +399,13 @@ impl PreviewRenderer {
 struct PreviewResult {
     warnings: Vec<String>,
     image_changed: bool,
+}
+
+#[derive(Default)]
+struct ResolvedTextureBindings {
+    slots: Vec<TextureBindingSlot>,
+    descriptor_bindings: Vec<Option<PreviewTextureHandle>>,
+    bindless_ids: Vec<u32>,
 }
 
 struct PreviewGpu {
