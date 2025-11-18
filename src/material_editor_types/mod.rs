@@ -253,6 +253,10 @@ impl MaterialTextureBinding {
         }
     }
 
+    pub fn bindless_id(&self) -> Option<u32> {
+        self.as_bindless()?.parse().ok()
+    }
+
     pub fn from_layout_value(value: String) -> Self {
         if value.trim().is_empty() {
             Self::Empty
@@ -305,7 +309,17 @@ impl serde::Serialize for MaterialTextureBinding {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(self.value().unwrap_or(""))
+        match self {
+            Self::Bindless { reference } => {
+                if let Ok(id) = reference.parse::<u64>() {
+                    serializer.serialize_u64(id)
+                } else {
+                    serializer.serialize_str(reference)
+                }
+            }
+            Self::Texture { id } => serializer.serialize_str(id),
+            Self::Empty => serializer.serialize_str(""),
+        }
     }
 }
 
@@ -314,8 +328,45 @@ impl<'de> serde::Deserialize<'de> for MaterialTextureBinding {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = String::deserialize(deserializer)?;
-        Ok(MaterialTextureBinding::from_layout_value(value))
+        struct BindingVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for BindingVisitor {
+            type Value = MaterialTextureBinding;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string or integer bindless reference")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(MaterialTextureBinding::from_layout_value(value.to_string()))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(MaterialTextureBinding::from_layout_value(value.to_string()))
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(MaterialTextureBinding::from_layout_value(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(MaterialTextureBinding::from_layout_value(value))
+            }
+        }
+
+        deserializer.deserialize_any(BindingVisitor)
     }
 }
 

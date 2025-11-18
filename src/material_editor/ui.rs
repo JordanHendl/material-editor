@@ -349,31 +349,79 @@ impl MaterialEditorApp {
             if slots.is_empty() {
                 ui.label("Selected shader does not expose texture bindings");
             } else {
+                let mut bind_group_indices = Vec::new();
+                let mut bindless_indices = Vec::new();
                 for (index, slot) in slots.iter().enumerate() {
-                    ui.horizontal(|ui| {
-                        ui.label(self.binding_slot_label(slot));
-                        let texture = working
-                            .textures
-                            .get_mut(index)
-                            .expect("binding slots sync ensures length");
-                        let label = texture
-                            .value()
-                            .filter(|value| !value.trim().is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| "<default>".to_string());
-                        ui.label(RichText::new(label).monospace());
-                        if ui.small_button("Pick").clicked() {
-                            let initial = texture.value().map(str::to_string);
-                            self.open_picker(PickerKind::Texture { slot: index }, initial);
-                        }
-                        if !matches!(slot.kind, TextureBindingKind::BindGroup { .. })
-                            && ui.small_button("Clear").clicked()
-                        {
+                    match slot.kind {
+                        TextureBindingKind::BindGroup { .. } => bind_group_indices.push(index),
+                        TextureBindingKind::BindTable { .. } => bindless_indices.push(index),
+                    }
+                }
+
+                if !bind_group_indices.is_empty() {
+                    ui.label("Descriptor-bound slots");
+                    for index in bind_group_indices {
+                        ui.horizontal(|ui| {
+                            let slot = &slots[index];
+                            ui.label(self.binding_slot_label(slot));
+                            let texture = working
+                                .textures
+                                .get_mut(index)
+                                .expect("binding slots sync ensures length");
+                            let label = texture
+                                .value()
+                                .filter(|value| !value.trim().is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| "<default>".to_string());
+                            ui.label(RichText::new(label).monospace());
+                            if ui.small_button("Pick").clicked() {
+                                let initial = texture.value().map(str::to_string);
+                                self.open_picker(PickerKind::Texture { slot: index }, initial);
+                            }
+                        });
+                    }
+                }
+
+                if !bindless_indices.is_empty() {
+                    ui.separator();
+                    ui.label("Bindless slots");
+                    for index in bindless_indices {
+                        ui.horizontal(|ui| {
+                            let slot = &slots[index];
+                            ui.label(self.binding_slot_label(slot));
+                            let texture = working
+                                .textures
+                                .get_mut(index)
+                                .expect("binding slots sync ensures length");
                             let before = texture.clone();
-                            texture.assign_value(&slot.kind, None);
+
+                            let mut numeric_id = texture.bindless_id().unwrap_or_default();
+                            let id_response = ui
+                                .add(
+                                    egui::DragValue::new(&mut numeric_id).clamp_range(0..=u32::MAX),
+                                )
+                                .on_hover_text("Bindless slot ID");
+                            if id_response.changed() {
+                                texture.assign_value(&slot.kind, Some(numeric_id.to_string()));
+                            }
+
+                            let label = texture
+                                .value()
+                                .filter(|value| !value.trim().is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| "<default>".to_string());
+                            ui.label(RichText::new(label).monospace());
+                            if ui.small_button("Catalog").clicked() {
+                                let initial = texture.value().map(str::to_string);
+                                self.open_picker(PickerKind::Texture { slot: index }, initial);
+                            }
+                            if ui.small_button("Clear").clicked() {
+                                texture.assign_value(&slot.kind, None);
+                            }
+
                             changed |= before != *texture;
-                        }
-                    });
+                        });
+                    }
                 }
             }
         } else {
