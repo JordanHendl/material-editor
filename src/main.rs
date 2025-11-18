@@ -1,10 +1,10 @@
+mod material_bindings;
 mod material_editor;
 mod material_editor_types;
-mod material_bindings;
 
-use std::path::PathBuf;
 use eframe::{Renderer, egui};
 use material_editor::{project::MaterialEditorProjectLoader, ui::MaterialEditorApp};
+use std::path::PathBuf;
 
 fn main() -> eframe::Result<()> {
     let project_root = parse_project_root();

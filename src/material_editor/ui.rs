@@ -15,7 +15,7 @@ use crate::{
             MaterialEditorProjectState,
         },
     },
-    material_editor_types::MaterialEditorMaterial,
+    material_editor_types::{MaterialEditorMaterial, MaterialTextureBinding},
 };
 
 pub struct MaterialEditorApp {
@@ -239,6 +239,7 @@ impl MaterialEditorApp {
         let resource = EditableResource::new(MaterialEditorMaterial::default());
         let graph_material = GraphMaterial {
             referenced_textures: Vec::new(),
+            referenced_bindless: Vec::new(),
             referenced_shader: None,
             preview_meshes: Vec::new(),
             resource,
@@ -355,25 +356,22 @@ impl MaterialEditorApp {
                             .textures
                             .get_mut(index)
                             .expect("binding slots sync ensures length");
-                        let label = if texture.trim().is_empty() {
-                            "<default>".to_string()
-                        } else {
-                            texture.clone()
-                        };
+                        let label = texture
+                            .value()
+                            .filter(|value| !value.trim().is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "<default>".to_string());
                         ui.label(RichText::new(label).monospace());
                         if ui.small_button("Pick").clicked() {
-                            let initial = if texture.trim().is_empty() {
-                                None
-                            } else {
-                                Some(texture.clone())
-                            };
+                            let initial = texture.value().map(str::to_string);
                             self.open_picker(PickerKind::Texture { slot: index }, initial);
                         }
                         if !matches!(slot.kind, TextureBindingKind::BindGroup { .. })
                             && ui.small_button("Clear").clicked()
                         {
-                            texture.clear();
-                            changed = true;
+                            let before = texture.clone();
+                            texture.assign_value(&slot.kind, None);
+                            changed |= before != *texture;
                         }
                     });
                 }
@@ -432,24 +430,50 @@ impl MaterialEditorApp {
         }
 
         if let Some(slots) = self.binding_schema(data) {
-            let mut seen: HashSet<String> = HashSet::new();
+            let mut seen_textures: HashSet<String> = HashSet::new();
+            let mut seen_bindless: HashSet<String> = HashSet::new();
             for (index, slot) in slots.iter().enumerate() {
-                let value = data
-                    .textures
-                    .get(index)
-                    .map(|entry| entry.trim())
-                    .unwrap_or("");
+                let value = data.textures.get(index).cloned().unwrap_or_default();
                 if value.is_empty() {
                     if matches!(slot.kind, TextureBindingKind::BindGroup { .. }) {
                         messages.push(format!("{} is unassigned", self.binding_slot_label(slot)));
                     }
                     continue;
                 }
-                if !self.state.graph.textures.contains_key(value) {
-                    messages.push(format!("Texture '{}' is missing", value));
-                }
-                if !seen.insert(value.to_string()) {
-                    messages.push(format!("Texture '{}' is bound multiple times", value));
+                match slot.kind {
+                    TextureBindingKind::BindGroup { .. } => {
+                        if let Some(texture) = value.as_texture() {
+                            if !self.state.graph.textures.contains_key(texture) {
+                                messages.push(format!("Texture '{}' is missing", texture));
+                            }
+                            if !seen_textures.insert(texture.to_string()) {
+                                messages
+                                    .push(format!("Texture '{}' is bound multiple times", texture));
+                            }
+                        } else if let Some(reference) = value.value() {
+                            messages.push(format!(
+                                "{} must reference a texture asset (got '{}')",
+                                self.binding_slot_label(slot),
+                                reference
+                            ));
+                        }
+                    }
+                    TextureBindingKind::BindTable { .. } => {
+                        if let Some(reference) = value.as_bindless().or_else(|| value.value()) {
+                            if !self.state.graph.textures.contains_key(reference) {
+                                messages.push(format!(
+                                    "Bindless reference '{}' is not in the catalog",
+                                    reference
+                                ));
+                            }
+                            if !seen_bindless.insert(reference.to_string()) {
+                                messages.push(format!(
+                                    "Bindless reference '{}' is used multiple times",
+                                    reference
+                                ));
+                            }
+                        }
+                    }
                 }
             }
         } else if data.shader.is_some() {
@@ -463,7 +487,22 @@ impl MaterialEditorApp {
         let _ = self.normalize_material(&mut data);
         let snapshot = if let Some(graph_material) = self.state.graph.materials.get_mut(id) {
             graph_material.resource.update(data);
-            graph_material.referenced_textures = graph_material.resource.data.textures.clone();
+            graph_material.referenced_textures = graph_material
+                .resource
+                .data
+                .textures
+                .iter()
+                .filter_map(MaterialTextureBinding::as_texture)
+                .map(str::to_string)
+                .collect();
+            graph_material.referenced_bindless = graph_material
+                .resource
+                .data
+                .textures
+                .iter()
+                .filter_map(MaterialTextureBinding::as_bindless)
+                .map(str::to_string)
+                .collect();
             graph_material.referenced_shader = graph_material.resource.data.shader.clone();
             Some(graph_material.resource.data.clone())
         } else {
@@ -479,8 +518,22 @@ impl MaterialEditorApp {
             let mut snapshot = None;
             if let Some(graph_material) = self.state.graph.materials.get_mut(&id) {
                 if graph_material.resource.undo() {
-                    graph_material.referenced_textures =
-                        graph_material.resource.data.textures.clone();
+                    graph_material.referenced_textures = graph_material
+                        .resource
+                        .data
+                        .textures
+                        .iter()
+                        .filter_map(MaterialTextureBinding::as_texture)
+                        .map(str::to_string)
+                        .collect();
+                    graph_material.referenced_bindless = graph_material
+                        .resource
+                        .data
+                        .textures
+                        .iter()
+                        .filter_map(MaterialTextureBinding::as_bindless)
+                        .map(str::to_string)
+                        .collect();
                     graph_material.referenced_shader = graph_material.resource.data.shader.clone();
                     snapshot = Some(graph_material.resource.data.clone());
                 }
@@ -496,8 +549,22 @@ impl MaterialEditorApp {
             let mut snapshot = None;
             if let Some(graph_material) = self.state.graph.materials.get_mut(&id) {
                 if graph_material.resource.redo() {
-                    graph_material.referenced_textures =
-                        graph_material.resource.data.textures.clone();
+                    graph_material.referenced_textures = graph_material
+                        .resource
+                        .data
+                        .textures
+                        .iter()
+                        .filter_map(MaterialTextureBinding::as_texture)
+                        .map(str::to_string)
+                        .collect();
+                    graph_material.referenced_bindless = graph_material
+                        .resource
+                        .data
+                        .textures
+                        .iter()
+                        .filter_map(MaterialTextureBinding::as_bindless)
+                        .map(str::to_string)
+                        .collect();
                     graph_material.referenced_shader = graph_material.resource.data.shader.clone();
                     snapshot = Some(graph_material.resource.data.clone());
                 }
@@ -600,16 +667,18 @@ impl MaterialEditorApp {
                 }
             }
             PickerKind::Texture { slot } => {
-                if slot >= material.textures.len() {
+                let Some(schema) = self.binding_schema(&material) else {
+                    return;
+                };
+                if slot >= material.textures.len() || slot >= schema.len() {
                     return;
                 }
-                if let Some(value) = choice.filter(|value| !value.is_empty()) {
-                    if material.textures[slot] != value {
-                        material.textures[slot] = value;
-                        changed = true;
-                    }
-                } else if !material.textures[slot].is_empty() {
-                    material.textures[slot].clear();
+                let slot_kind = &schema[slot].kind;
+                let mut binding = material.textures.get(slot).cloned().unwrap_or_default();
+                let before = binding.clone();
+                binding.assign_value(slot_kind, choice.filter(|value| !value.is_empty()));
+                if before != binding {
+                    material.textures[slot] = binding;
                     changed = true;
                 }
             }
@@ -649,8 +718,13 @@ impl MaterialEditorApp {
             changed = true;
         }
         while material.textures.len() < slots.len() {
-            material.textures.push(String::new());
+            material.textures.push(MaterialTextureBinding::default());
             changed = true;
+        }
+        for (binding, slot) in material.textures.iter_mut().zip(slots) {
+            let before = binding.clone();
+            binding.coerce_kind(&slot.kind);
+            changed |= before != *binding;
         }
         changed
     }

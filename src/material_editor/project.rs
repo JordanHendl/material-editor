@@ -4,13 +4,15 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use noren::parsing::{ModelLayoutFile, RenderPassLayoutFile};
+use noren::parsing::{GraphicsShaderLayout, ModelLayoutFile, RenderPassLayoutFile};
 
 use crate::{
+    material_bindings::texture_binding_slots,
     material_editor::io::{ProjectIoError, read_json_file_blocking, write_json_file_blocking},
     material_editor_types::{
         MaterialEditorDatabaseLayout, MaterialEditorGraphicsShader, MaterialEditorMaterial,
         MaterialEditorMesh, MaterialEditorProject, MaterialEditorRenderPass, MaterialEditorTexture,
+        MaterialTextureBinding,
     },
 };
 
@@ -405,6 +407,7 @@ impl<T> Default for HistoryTracker<T> {
 pub struct GraphMaterial {
     pub resource: EditableResource<MaterialEditorMaterial>,
     pub referenced_textures: Vec<String>,
+    pub referenced_bindless: Vec<String>,
     pub referenced_shader: Option<String>,
     pub preview_meshes: Vec<String>,
 }
@@ -506,10 +509,31 @@ impl AssetGraph {
             .materials
             .iter()
             .map(|(id, material)| {
+                let mut material = material.clone();
+                if let Some(shader_id) = &material.shader {
+                    if let Some(shader) = project.shaders.get(shader_id) {
+                        let layout: GraphicsShaderLayout = shader.clone().into();
+                        let slots = texture_binding_slots(&layout);
+                        for (binding, slot) in material.textures.iter_mut().zip(slots.iter()) {
+                            binding.coerce_kind(&slot.kind);
+                        }
+                    }
+                }
                 (
                     id.clone(),
                     GraphMaterial {
-                        referenced_textures: material.textures.clone(),
+                        referenced_textures: material
+                            .textures
+                            .iter()
+                            .filter_map(MaterialTextureBinding::as_texture)
+                            .map(str::to_string)
+                            .collect(),
+                        referenced_bindless: material
+                            .textures
+                            .iter()
+                            .filter_map(MaterialTextureBinding::as_bindless)
+                            .map(str::to_string)
+                            .collect(),
                         referenced_shader: material.shader.clone(),
                         preview_meshes: preview_lookup.remove(id).unwrap_or_else(Vec::new),
                         resource: EditableResource::new(material.clone()),
@@ -564,16 +588,40 @@ mod tests {
         let state =
             MaterialEditorProjectLoader::load_blocking(&root).expect("sample project loads");
 
-        assert_eq!(state.project.materials.len(), 1);
+        assert_eq!(state.project.materials.len(), 3);
         let material = state
             .graph
             .materials
             .get("material/quad")
             .expect("material present");
+        assert!(material.referenced_textures.is_empty());
+        assert!(material.preview_meshes.is_empty());
+
+        let multi_bind_material = state
+            .graph
+            .materials
+            .get("material/multi_bind")
+            .expect("multi bind material present");
         assert_eq!(
-            material.referenced_textures,
-            vec![String::from("texture/quad_diffuse")]
+            multi_bind_material.referenced_textures,
+            vec![
+                String::from("texture/quad_diffuse"),
+                String::from("texture/quad_overlay"),
+            ]
         );
-        assert_eq!(material.preview_meshes, vec![String::from("mesh/quad")]);
+
+        let bind_table_material = state
+            .graph
+            .materials
+            .get("material/bind_table")
+            .expect("bind table material present");
+        assert_eq!(
+            bind_table_material.referenced_textures,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            bind_table_material.referenced_bindless,
+            vec![String::from("texture/quad_overlay")]
+        );
     }
 }

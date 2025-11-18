@@ -22,11 +22,11 @@
 
 use std::collections::HashMap;
 
+use dashi::{AttachmentDescription, SubpassDependency, Viewport, cfg};
 use noren::parsing::{
     DatabaseLayoutFile, GraphicsShaderLayout, MaterialLayout, MeshLayout, ModelLayout,
     ModelLayoutFile, RenderPassLayout, RenderPassLayoutFile, RenderSubpassLayout, TextureLayout,
 };
-use dashi::{AttachmentDescription, SubpassDependency, Viewport, cfg};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -214,6 +214,111 @@ pub struct MaterialEditorTexture {
     pub name: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterialTextureBinding {
+    Empty,
+    Texture { id: String },
+    Bindless { reference: String },
+}
+
+impl Default for MaterialTextureBinding {
+    fn default() -> Self {
+        Self::Empty
+    }
+}
+
+impl MaterialTextureBinding {
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    pub fn value(&self) -> Option<&str> {
+        match self {
+            Self::Texture { id } | Self::Bindless { reference: id } => Some(id.as_str()),
+            Self::Empty => None,
+        }
+    }
+
+    pub fn as_texture(&self) -> Option<&str> {
+        match self {
+            Self::Texture { id } => Some(id.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_bindless(&self) -> Option<&str> {
+        match self {
+            Self::Bindless { reference } => Some(reference.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn from_layout_value(value: String) -> Self {
+        if value.trim().is_empty() {
+            Self::Empty
+        } else {
+            Self::Texture { id: value }
+        }
+    }
+
+    pub fn as_layout_value(&self) -> String {
+        self.value().unwrap_or("").to_string()
+    }
+
+    pub fn coerce_kind(&mut self, slot: &crate::material_bindings::TextureBindingKind) {
+        if let Some(value) = self.value().map(str::to_string) {
+            *self = match slot {
+                crate::material_bindings::TextureBindingKind::BindGroup { .. } => {
+                    MaterialTextureBinding::Texture { id: value }
+                }
+                crate::material_bindings::TextureBindingKind::BindTable { .. } => {
+                    MaterialTextureBinding::Bindless { reference: value }
+                }
+            };
+        } else {
+            *self = MaterialTextureBinding::Empty;
+        }
+    }
+
+    pub fn assign_value(
+        &mut self,
+        slot: &crate::material_bindings::TextureBindingKind,
+        value: Option<String>,
+    ) {
+        if let Some(raw) = value.filter(|val| !val.trim().is_empty()) {
+            *self = match slot {
+                crate::material_bindings::TextureBindingKind::BindGroup { .. } => {
+                    MaterialTextureBinding::Texture { id: raw }
+                }
+                crate::material_bindings::TextureBindingKind::BindTable { .. } => {
+                    MaterialTextureBinding::Bindless { reference: raw }
+                }
+            };
+        } else {
+            *self = MaterialTextureBinding::Empty;
+        }
+    }
+}
+
+impl serde::Serialize for MaterialTextureBinding {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.value().unwrap_or(""))
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for MaterialTextureBinding {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Ok(MaterialTextureBinding::from_layout_value(value))
+    }
+}
+
 impl From<TextureLayout> for MaterialEditorTexture {
     fn from(value: TextureLayout) -> Self {
         Self {
@@ -235,7 +340,7 @@ impl From<MaterialEditorTexture> for TextureLayout {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MaterialEditorMaterial {
     pub name: Option<String>,
-    pub textures: Vec<String>,
+    pub textures: Vec<MaterialTextureBinding>,
     pub shader: Option<String>,
 }
 
@@ -243,7 +348,11 @@ impl From<MaterialLayout> for MaterialEditorMaterial {
     fn from(value: MaterialLayout) -> Self {
         Self {
             name: value.name,
-            textures: value.textures,
+            textures: value
+                .textures
+                .into_iter()
+                .map(MaterialTextureBinding::from_layout_value)
+                .collect(),
             shader: value.shader,
         }
     }
@@ -253,7 +362,11 @@ impl From<MaterialEditorMaterial> for MaterialLayout {
     fn from(value: MaterialEditorMaterial) -> Self {
         Self {
             name: value.name,
-            textures: value.textures,
+            textures: value
+                .textures
+                .iter()
+                .map(MaterialTextureBinding::as_layout_value)
+                .collect(),
             shader: value.shader,
         }
     }
