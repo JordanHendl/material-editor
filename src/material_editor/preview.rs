@@ -2,18 +2,18 @@ use std::{
     collections::HashMap,
     f32::consts::PI,
     hash::{Hash, Hasher},
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use bytemuck::{Pod, Zeroable};
 use dashi::gpu::execution::CommandRing;
 use dashi::{
-    AspectMask, BindGroupLayout, BindGroupLayoutInfo, BindGroupVariable, BindGroupVariableType,
-    BufferInfo, BufferUsage, ClearValue, CommandQueueInfo2, Context, ContextInfo, DepthInfo,
-    Format, GraphicsPipelineDetails, GraphicsPipelineInfo, GraphicsPipelineLayoutInfo, Handle,
-    ImageInfo, ImageView, MemoryVisibility, PipelineShaderInfo, Rect2D, ShaderPrimitiveType,
-    ShaderType, VertexDescriptionInfo, VertexEntryInfo, VertexRate, Viewport,
-    builders::RenderPassBuilder,
+    AspectMask, AttachmentDescription, BindGroupLayout, BindGroupLayoutInfo, BindGroupVariable,
+    BindGroupVariableType, BindTableLayout, BindTableLayoutInfo, BufferInfo, BufferUsage,
+    ClearValue, CommandQueueInfo2, Context, ContextInfo, DepthInfo, Format,
+    GraphicsPipelineDetails, GraphicsPipelineLayoutInfo, Handle, ImageInfo, ImageView,
+    MemoryVisibility, PipelineShaderInfo, SampleCount, ShaderPrimitiveType, ShaderType,
+    VertexDescriptionInfo, VertexEntryInfo, VertexRate, Viewport,
     driver::command::{BeginRenderPass, CopyImageBuffer, DrawIndexed},
     gpu::CommandStream,
 };
@@ -21,10 +21,11 @@ use eframe::egui::{self, Color32, ColorImage};
 use glam::{Mat3, Mat4, Vec3};
 use noren::datatypes::{
     DatabaseEntry, ImageDB, ShaderDB, ShaderModule, leak_database_entry, primitives::Vertex,
+    render_pass::RenderPassDB,
 };
 use shaderc::{Compiler, ShaderKind};
 
-use noren::parsing::GraphicsShaderLayout;
+use noren::parsing::{GraphicsShaderLayout, RenderPassLayout};
 
 use crate::{
     material_bindings::{TextureBindingKind, TextureBindingSlot, texture_binding_slots},
@@ -33,9 +34,6 @@ use crate::{
         MaterialEditorDatabaseLayout, MaterialEditorGraphicsShader, MaterialEditorMaterial,
     },
 };
-
-const PREVIEW_WIDTH: usize = 320;
-const PREVIEW_HEIGHT: usize = 240;
 
 pub struct MaterialPreviewPanel {
     renderer: PreviewRenderer,
@@ -73,8 +71,9 @@ impl MaterialPreviewPanel {
                 self.update_texture(ui, result.image_changed);
 
                 if let Some(texture) = &self.texture {
-                    let aspect = PREVIEW_HEIGHT as f32 / PREVIEW_WIDTH as f32;
-                    let width = ui.available_width().min(PREVIEW_WIDTH as f32);
+                    let [width_px, height_px] = self.renderer.preview_size;
+                    let aspect = height_px as f32 / width_px as f32;
+                    let width = ui.available_width().min(width_px as f32);
                     let height = width * aspect;
                     let image =
                         egui::Image::new(texture).fit_to_exact_size(egui::vec2(width, height));
@@ -160,6 +159,7 @@ struct PreviewRenderer {
     mesh_cache: PreviewMeshCache,
     assets: PreviewAssetCache,
     image: ColorImage,
+    preview_size: [usize; 2],
     gpu: Option<PreviewGpu>,
     gpu_error: Option<String>,
 }
@@ -173,15 +173,16 @@ impl PreviewRenderer {
         Self {
             config: PreviewConfig::default(),
             mesh_cache: PreviewMeshCache::default(),
-            assets: PreviewAssetCache::new(state.root(), &state.layout),
-            image: ColorImage::new([PREVIEW_WIDTH, PREVIEW_HEIGHT], Color32::BLACK),
+            assets: PreviewAssetCache::new(state),
+            image: ColorImage::new([320, 240], Color32::BLACK),
+            preview_size: [320, 240],
             gpu,
             gpu_error,
         }
     }
 
     fn sync_with_state(&mut self, state: &MaterialEditorProjectState) {
-        self.assets.reset(state.root(), &state.layout);
+        self.assets.reset(state);
     }
 
     fn render(
@@ -213,20 +214,50 @@ impl PreviewRenderer {
                 .gpu
                 .as_mut()
                 .expect("gpu should be present after check");
-            self.assets
-                .ensure_imagery(state.root(), &state.layout, gpu_for_assets);
+            self.assets.ensure_render_passes(state);
+            self.assets.ensure_imagery(state, gpu_for_assets);
         }
-        self.assets.ensure_shaders(state.root(), &state.layout);
+        self.assets.ensure_shaders(state);
 
-        let resolved = match self.resolve_textures(material, state, &mut warnings) {
-            Some(result) => result,
-            None => {
-                warnings.push(
-                    "Shader information unavailable; preview will use fallback colors".into(),
-                );
-                ResolvedTextureBindings::default()
+        let mut shader_layout: Option<GraphicsShaderLayout> = None;
+        let mut render_pass_layout: Option<RenderPassLayout> = None;
+        let mut render_pass_key: Option<String> = None;
+        let mut shader_modules: Option<PreviewShaderModules> = None;
+        let mut shader_label = "builtin_preview".to_string();
+
+        if let Some(shader_id) = material.shader.as_deref() {
+            shader_label = shader_id.to_string();
+            match state.graph.shaders.get(shader_id) {
+                Some(shader) => {
+                    let layout: GraphicsShaderLayout = shader.resource.data.clone().into();
+                    render_pass_key = layout.render_pass.clone();
+                    if let Some(pass_key) = &render_pass_key {
+                        if let Some(pass_layout) = self.assets.render_pass_layouts.get(pass_key) {
+                            render_pass_layout = Some(pass_layout.clone());
+                        } else {
+                            warnings.push(format!("Render pass '{pass_key}' is missing"));
+                        }
+                    }
+                    shader_layout = Some(layout);
+                    match self.assets.shader_modules(shader_id, &shader.resource.data) {
+                        Ok(mods) => shader_modules = Some(mods),
+                        Err(err) => warnings.push(err),
+                    }
+                }
+                None => warnings.push(format!("Shader '{shader_id}' is missing")),
             }
-        };
+        }
+
+        let resolved =
+            match self.resolve_textures(shader_layout.as_ref(), material, state, &mut warnings) {
+                Some(result) => result,
+                None => {
+                    warnings.push(
+                        "Shader information unavailable; preview will use fallback colors".into(),
+                    );
+                    ResolvedTextureBindings::default()
+                }
+            };
 
         let texture = resolved
             .descriptor_bindings
@@ -237,30 +268,6 @@ impl PreviewRenderer {
         if texture.is_none() {
             warnings.push("No previewable texture bindings; using fallback colors".to_string());
         }
-
-        let shader_label = material
-            .shader
-            .as_deref()
-            .unwrap_or("builtin_preview")
-            .to_string();
-        let shader_modules = match material.shader.as_deref() {
-            Some(shader_id) => match state.graph.shaders.get(shader_id) {
-                Some(shader) => {
-                    match self.assets.shader_modules(shader_id, &shader.resource.data) {
-                        Ok(mods) => Some(mods),
-                        Err(err) => {
-                            warnings.push(err);
-                            None
-                        }
-                    }
-                }
-                None => {
-                    warnings.push(format!("Shader '{shader_id}' is missing"));
-                    None
-                }
-            },
-            None => None,
-        };
 
         let gpu = self
             .gpu
@@ -282,10 +289,14 @@ impl PreviewRenderer {
             background,
             light_dir,
             &mut self.image,
+            shader_layout.as_ref(),
+            render_pass_key,
+            render_pass_layout.as_ref(),
             &shader_label,
             shader_modules
                 .as_ref()
                 .map(|modules| (&modules.vertex, &modules.fragment)),
+            &mut self.assets,
         );
 
         if let Err(err) = render_result {
@@ -298,6 +309,8 @@ impl PreviewRenderer {
             };
         }
 
+        self.preview_size = self.image.size;
+
         PreviewResult {
             warnings,
             image_changed: true,
@@ -306,14 +319,13 @@ impl PreviewRenderer {
 
     fn resolve_textures(
         &mut self,
+        layout: Option<&GraphicsShaderLayout>,
         material: &MaterialEditorMaterial,
         state: &MaterialEditorProjectState,
         warnings: &mut Vec<String>,
     ) -> Option<ResolvedTextureBindings> {
-        let shader_id = material.shader.as_ref()?;
-        let shader = state.graph.shaders.get(shader_id)?;
-        let layout: GraphicsShaderLayout = shader.resource.data.clone().into();
-        let slots = texture_binding_slots(&layout);
+        let layout = layout?;
+        let slots = texture_binding_slots(layout);
         let mut handles = Vec::with_capacity(slots.len());
         let mut bindless_ids = Vec::new();
         for (index, slot) in slots.iter().enumerate() {
@@ -411,16 +423,20 @@ struct ResolvedTextureBindings {
 struct PreviewGpu {
     ctx: Context,
     ring: CommandRing,
-    render_pass: Handle<dashi::RenderPass>,
-    target: PreviewTarget,
+    target: Option<PreviewTarget>,
+    target_signature: Option<RenderTargetSignature>,
     pipeline: Option<PreviewPipeline>,
     pipeline_signature: Option<PreviewShaderSignature>,
     sampler: Handle<dashi::Sampler>,
-    bind_group_layout: Handle<BindGroupLayout>,
     uniform_buffer: Handle<dashi::Buffer>,
     fallback_texture: PreviewTextureHandle,
     bind_groups: HashMap<String, Handle<dashi::BindGroup>>,
     builtin_shader: BuiltinShader,
+    fallback_bind_group_layout: Handle<BindGroupLayout>,
+    bind_group_layouts: HashMap<u64, Handle<BindGroupLayout>>,
+    bind_table_layouts: HashMap<u64, Handle<BindTableLayout>>,
+    builtin_render_pass: RenderPassLayout,
+    builtin_render_pass_db: RenderPassDB,
 }
 
 impl PreviewGpu {
@@ -433,39 +449,6 @@ impl PreviewGpu {
                 ..Default::default()
             })
             .map_err(|err| format!("unable to create command ring: {err}"))?;
-
-        let viewport = Viewport {
-            area: dashi::FRect2D {
-                x: 0.0,
-                y: 0.0,
-                w: PREVIEW_WIDTH as f32,
-                h: PREVIEW_HEIGHT as f32,
-            },
-            scissor: Rect2D {
-                x: 0,
-                y: 0,
-                w: PREVIEW_WIDTH as u32,
-                h: PREVIEW_HEIGHT as u32,
-            },
-            min_depth: 0.0,
-            max_depth: 1.0,
-        };
-
-        let color_attachment = dashi::AttachmentDescription {
-            format: Format::RGBA8,
-            ..Default::default()
-        };
-        let depth_attachment = dashi::AttachmentDescription {
-            format: Format::D24S8,
-            ..Default::default()
-        };
-
-        let render_pass = RenderPassBuilder::new("material_preview", viewport)
-            .add_subpass(&[color_attachment], Some(&depth_attachment), &[])
-            .build(&mut ctx)
-            .map_err(|_| "failed to build preview render pass".to_string())?;
-
-        let target = PreviewTarget::new(&mut ctx)?;
         let uniform_buffer = ctx
             .make_buffer(&BufferInfo {
                 debug_name: "preview_uniforms",
@@ -480,11 +463,11 @@ impl PreviewGpu {
             .make_sampler(&Default::default())
             .map_err(|_| "failed to create sampler".to_string())?;
 
-        let bind_group_layout = create_bind_group_layout(&mut ctx)?;
+        let fallback_bind_group_layout = create_bind_group_layout(&mut ctx)?;
         let fallback_texture = PreviewTextureHandle::solid_color(&mut ctx, [200, 120, 240, 255])?;
         let bind_group = create_bind_group(
             &mut ctx,
-            bind_group_layout,
+            fallback_bind_group_layout,
             uniform_buffer,
             sampler,
             fallback_texture.view,
@@ -493,20 +476,28 @@ impl PreviewGpu {
         bind_groups.insert("fallback".to_string(), bind_group);
 
         let builtin_shader = builtin_shader_modules()?;
+        let builtin_render_pass = builtin_render_pass_layout();
+        let mut render_passes = HashMap::new();
+        render_passes.insert("builtin_preview".to_string(), builtin_render_pass.clone());
+        let builtin_render_pass_db = RenderPassDB::new(render_passes);
 
         Ok(Self {
             ctx,
             ring,
-            render_pass,
-            target,
+            target: None,
+            target_signature: None,
             pipeline: None,
             pipeline_signature: None,
             sampler,
-            bind_group_layout,
             uniform_buffer,
             fallback_texture,
             bind_groups,
             builtin_shader,
+            fallback_bind_group_layout,
+            bind_group_layouts: HashMap::new(),
+            bind_table_layouts: HashMap::new(),
+            builtin_render_pass,
+            builtin_render_pass_db,
         })
     }
 
@@ -518,22 +509,68 @@ impl PreviewGpu {
         background: Color32,
         light_dir: Vec3,
         image: &mut ColorImage,
+        shader_layout: Option<&GraphicsShaderLayout>,
+        render_pass_key: Option<String>,
+        render_pass_layout: Option<&RenderPassLayout>,
         shader_label: &str,
         shader_modules: Option<(&ShaderModule, &ShaderModule)>,
+        assets: &mut PreviewAssetCache,
     ) -> Result<(), String> {
-        self.ensure_pipeline(shader_label, shader_modules)?;
-        let pipeline_handle = self
-            .pipeline
-            .as_ref()
-            .map(|pipeline| pipeline.pipeline)
-            .ok_or_else(|| "preview pipeline unavailable".to_string())?;
+        let render_pass_key = render_pass_key.unwrap_or_else(|| "builtin_preview".to_string());
+        let render_pass_layout = render_pass_layout
+            .cloned()
+            .unwrap_or_else(|| self.builtin_render_pass.clone());
+        self.ensure_pipeline(
+            shader_label,
+            shader_layout,
+            &render_pass_key,
+            &render_pass_layout,
+            shader_modules,
+            assets,
+        )?;
+        self.ensure_target(&render_pass_key, &render_pass_layout)?;
+        let pipeline_snapshot = {
+            let pipeline = self
+                .pipeline
+                .as_ref()
+                .ok_or_else(|| "preview pipeline unavailable".to_string())?;
+            (
+                pipeline.pipeline,
+                pipeline.bind_group_layout,
+                pipeline.layout_hash,
+                pipeline.render_pass,
+                pipeline.viewport,
+            )
+        };
         let has_texture = texture.is_some();
-        self.update_uniforms(config, light_dir, has_texture)?;
+        let target_snapshot = {
+            let target = self
+                .target
+                .as_ref()
+                .ok_or_else(|| "preview target unavailable".to_string())?;
+            let color_image = *target
+                .color_images
+                .first()
+                .ok_or_else(|| "preview target missing color image".to_string())?;
+            (
+                color_image,
+                target.readback,
+                target.color_views,
+                target.depth_view,
+                target.size,
+                target.format,
+            )
+        };
+        let (color_image, readback, color_views, depth_view, target_size, target_format) =
+            target_snapshot;
+        let (pipeline_handle, bind_group_layout, layout_hash, render_pass_handle, viewport) =
+            pipeline_snapshot;
+        self.update_uniforms(config, light_dir, has_texture, target_size)?;
         let resolved_texture = match texture {
             Some(handle) => handle,
             None => self.fallback_texture.clone(),
         };
-        let bind_group = self.bind_group_for(&resolved_texture)?;
+        let bind_group = self.bind_group_for(&resolved_texture, bind_group_layout, layout_hash)?;
 
         let clear = ClearValue::Color([
             background.r() as f32 / 255.0,
@@ -542,20 +579,20 @@ impl PreviewGpu {
             1.0,
         ]);
 
-        let depthclear = ClearValue::DepthStencil {
+        let depthclear = depth_view.map(|_| ClearValue::DepthStencil {
             depth: 1.0,
             stencil: 0,
-        };
+        });
 
         self.ring
             .record(|cmd| {
                 let stream = CommandStream::new().begin();
                 let begin_pass = BeginRenderPass {
-                    viewport: self.target.viewport,
-                    render_pass: self.render_pass,
-                    color_attachments: [Some(self.target.color_view), None, None, None],
-                    depth_attachment: Some(self.target.depth_view),
-                    clear_values: [Some(clear), Some(depthclear), None, None],
+                    viewport,
+                    render_pass: render_pass_handle,
+                    color_attachments: color_views,
+                    depth_attachment: depth_view,
+                    clear_values: [Some(clear), depthclear, None, None],
                 };
                 let pending = stream.begin_render_pass(&begin_pass);
                 let mut drawing = pending.bind_graphics_pipeline(pipeline_handle);
@@ -569,8 +606,8 @@ impl PreviewGpu {
                 let mut recording = pending.stop_drawing();
 
                 let copy = CopyImageBuffer {
-                    src: self.target.color,
-                    dst: self.target.readback,
+                    src: color_image,
+                    dst: readback,
                     range: Default::default(),
                     dst_offset: 0,
                 };
@@ -587,7 +624,7 @@ impl PreviewGpu {
             .wait_all()
             .map_err(|err| format!("failed to wait for preview commands: {err}"))?;
 
-        self.readback(image)?;
+        self.readback(readback, target_size, target_format, image)?;
         Ok(())
     }
 
@@ -598,49 +635,228 @@ impl PreviewGpu {
     fn ensure_pipeline(
         &mut self,
         shader_label: &str,
+        shader_layout: Option<&GraphicsShaderLayout>,
+        render_pass_key: &str,
+        render_pass_layout: &RenderPassLayout,
         shader_modules: Option<(&ShaderModule, &ShaderModule)>,
+        assets: &mut PreviewAssetCache,
     ) -> Result<(), String> {
         let (vertex, fragment, label) = match shader_modules {
-            Some((vertex, fragment)) => (vertex, fragment, shader_label),
+            Some((vertex, fragment)) => {
+                (vertex.clone(), fragment.clone(), shader_label.to_string())
+            }
             None => (
-                &self.builtin_shader.vertex,
-                &self.builtin_shader.fragment,
-                "builtin_preview",
+                self.builtin_shader.vertex.clone(),
+                self.builtin_shader.fragment.clone(),
+                "builtin_preview".to_string(),
             ),
         };
 
-        let signature = PreviewShaderSignature::from_modules(label, vertex, fragment);
+        let layout_hash = hash_graphics_layout(shader_layout);
+        let signature = PreviewShaderSignature::from_modules(
+            &label,
+            &vertex,
+            &fragment,
+            render_pass_key,
+            layout_hash,
+        );
         if self.pipeline_signature.as_ref() != Some(&signature) {
-            let pipeline = PreviewPipeline::new(
-                &mut self.ctx,
-                self.render_pass,
-                self.bind_group_layout,
-                vertex,
-                fragment,
-                label,
-            )?;
-            self.pipeline = Some(pipeline);
+            let (bg_layouts, bt_layouts, active_bind_group) =
+                self.build_layout_handles(shader_layout)?;
+            let vertex_info = VertexDescriptionInfo {
+                entries: &VERTEX_ENTRIES,
+                stride: std::mem::size_of::<Vertex>(),
+                rate: VertexRate::Vertex,
+            };
+
+            let mut details = GraphicsPipelineDetails::default();
+            let subpass_id = shader_layout.map(|layout| layout.subpass).unwrap_or(0);
+            if render_pass_layout
+                .subpasses
+                .get(subpass_id as usize)
+                .and_then(|subpass| subpass.depth_stencil_attachment.as_ref())
+                .is_some()
+            {
+                details.depth_test = Some(DepthInfo {
+                    should_test: true,
+                    should_write: true,
+                });
+            }
+
+            let shaders = [
+                PipelineShaderInfo {
+                    stage: ShaderType::Vertex,
+                    spirv: vertex.words(),
+                    specialization: &[],
+                },
+                PipelineShaderInfo {
+                    stage: ShaderType::Fragment,
+                    spirv: fragment.words(),
+                    specialization: &[],
+                },
+            ];
+
+            let layout_info = GraphicsPipelineLayoutInfo {
+                debug_name: label.as_str(),
+                vertex_info,
+                bg_layouts,
+                bt_layouts,
+                shaders: &shaders,
+                details,
+            };
+
+            let pipeline_layout = self
+                .ctx
+                .make_graphics_pipeline_layout(&layout_info)
+                .map_err(|_| "failed to build pipeline layout".to_string())?;
+
+            let pass_db = if render_pass_key == "builtin_preview" {
+                &mut self.builtin_render_pass_db
+            } else {
+                assets
+                    .render_passes
+                    .as_mut()
+                    .ok_or_else(|| "render pass database unavailable".to_string())?
+            };
+
+            let pipeline_info = pass_db
+                .pipeline_info(
+                    render_pass_key,
+                    subpass_id,
+                    pipeline_layout,
+                    label.as_str(),
+                    &mut self.ctx,
+                )
+                .map_err(|err| format!("failed to prepare pipeline info: {err}"))?;
+
+            let pipeline = self
+                .ctx
+                .make_graphics_pipeline(&pipeline_info)
+                .map_err(|_| "failed to build graphics pipeline".to_string())?;
+
+            self.pipeline = Some(PreviewPipeline {
+                pipeline,
+                render_pass: pipeline_info.render_pass,
+                viewport: render_pass_layout.viewport,
+                bind_group_layout: active_bind_group,
+                layout_hash,
+            });
             self.pipeline_signature = Some(signature);
         }
         Ok(())
     }
 
+    fn build_layout_handles(
+        &mut self,
+        layout: Option<&GraphicsShaderLayout>,
+    ) -> Result<
+        (
+            [Option<Handle<BindGroupLayout>>; 4],
+            [Option<Handle<BindTableLayout>>; 4],
+            Handle<BindGroupLayout>,
+        ),
+        String,
+    > {
+        let mut bg_layouts: [Option<Handle<BindGroupLayout>>; 4] = Default::default();
+        let mut bt_layouts: [Option<Handle<BindTableLayout>>; 4] = Default::default();
+        let mut active = self.fallback_bind_group_layout;
+
+        if let Some(layout) = layout {
+            for (idx, cfg_opt) in layout.bind_group_layouts.iter().enumerate().take(4) {
+                if let Some(cfg) = cfg_opt {
+                    let (handle, _) = self.bind_group_layout_handle(cfg)?;
+                    if idx == 0 {
+                        active = handle;
+                    }
+                    bg_layouts[idx] = Some(handle);
+                }
+            }
+
+            for (idx, cfg_opt) in layout.bind_table_layouts.iter().enumerate().take(4) {
+                if let Some(cfg) = cfg_opt {
+                    let handle = self.bind_table_layout_handle(cfg)?;
+                    bt_layouts[idx] = Some(handle);
+                }
+            }
+        }
+
+        if bg_layouts[0].is_none() {
+            bg_layouts[0] = Some(self.fallback_bind_group_layout);
+            active = self.fallback_bind_group_layout;
+        }
+
+        Ok((bg_layouts, bt_layouts, active))
+    }
+
+    fn bind_group_layout_handle(
+        &mut self,
+        cfg: &dashi::cfg::BindGroupLayoutCfg,
+    ) -> Result<(Handle<BindGroupLayout>, u64), String> {
+        let hash = hash_json(cfg)?;
+        if let Some(existing) = self.bind_group_layouts.get(&hash) {
+            return Ok((*existing, hash));
+        }
+        let borrowed = cfg.borrow();
+        let info: BindGroupLayoutInfo<'_> = borrowed.info();
+        let handle = self
+            .ctx
+            .make_bind_group_layout(&info)
+            .map_err(|err| format!("failed to create bind group layout: {err}"))?;
+        self.bind_group_layouts.insert(hash, handle);
+        Ok((handle, hash))
+    }
+
+    fn bind_table_layout_handle(
+        &mut self,
+        cfg: &dashi::cfg::BindTableLayoutCfg,
+    ) -> Result<Handle<BindTableLayout>, String> {
+        let hash = hash_json(cfg)?;
+        if let Some(existing) = self.bind_table_layouts.get(&hash) {
+            return Ok(*existing);
+        }
+        let borrowed = cfg.borrow();
+        let info: BindTableLayoutInfo<'_> = borrowed.info();
+        let handle = self
+            .ctx
+            .make_bind_table_layout(&info)
+            .map_err(|err| format!("failed to create bind table layout: {err}"))?;
+        self.bind_table_layouts.insert(hash, handle);
+        Ok(handle)
+    }
+
     fn bind_group_for(
         &mut self,
         texture: &PreviewTextureHandle,
+        layout: Handle<BindGroupLayout>,
+        layout_hash: u64,
     ) -> Result<Handle<dashi::BindGroup>, String> {
-        if let Some(handle) = self.bind_groups.get(&texture.name) {
+        let key = format!("{}:{layout_hash}", texture.name);
+        if let Some(handle) = self.bind_groups.get(&key) {
             return Ok(*handle);
         }
         let handle = create_bind_group(
             &mut self.ctx,
-            self.bind_group_layout,
+            layout,
             self.uniform_buffer,
             self.sampler,
             texture.view,
         )?;
-        self.bind_groups.insert(texture.name.clone(), handle);
+        self.bind_groups.insert(key, handle);
         Ok(handle)
+    }
+
+    fn ensure_target(
+        &mut self,
+        render_pass_key: &str,
+        render_pass_layout: &RenderPassLayout,
+    ) -> Result<(), String> {
+        let signature = RenderTargetSignature::from_layout(render_pass_key, render_pass_layout)?;
+        if self.target_signature.as_ref() != Some(&signature) {
+            let target = PreviewTarget::new(&mut self.ctx, &signature, render_pass_layout)?;
+            self.target = Some(target);
+            self.target_signature = Some(signature);
+        }
+        Ok(())
     }
 
     fn update_uniforms(
@@ -648,9 +864,10 @@ impl PreviewGpu {
         config: &PreviewConfig,
         light_dir: Vec3,
         has_texture: bool,
+        target_size: [u32; 2],
     ) -> Result<(), String> {
         let view = config.camera.view_matrix();
-        let aspect = PREVIEW_WIDTH as f32 / PREVIEW_HEIGHT as f32;
+        let aspect = target_size[0] as f32 / target_size[1].max(1) as f32;
         let proj = Mat4::perspective_rh_gl(45.0_f32.to_radians(), aspect, 0.1, 50.0);
         let view_proj = proj * view;
 
@@ -677,72 +894,153 @@ impl PreviewGpu {
         Ok(())
     }
 
-    fn readback(&mut self, image: &mut ColorImage) -> Result<(), String> {
+    fn readback(
+        &mut self,
+        readback: Handle<dashi::Buffer>,
+        size: [u32; 2],
+        format: Format,
+        image: &mut ColorImage,
+    ) -> Result<(), String> {
+        let bpp = bytes_per_pixel(format)
+            .ok_or_else(|| format!("Unsupported preview format {:?}", format))?;
         let mapped: &[u8] = self
             .ctx
-            .map_buffer(self.target.readback)
+            .map_buffer(readback)
             .map_err(|_| "failed to map readback buffer".to_string())?;
-        let mut pixels = Vec::with_capacity(PREVIEW_WIDTH * PREVIEW_HEIGHT);
-        for chunk in mapped.chunks_exact(4) {
-            let color = Color32::from_rgba_unmultiplied(chunk[0], chunk[1], chunk[2], chunk[3]);
+        let mut pixels = Vec::with_capacity((size[0] * size[1]) as usize);
+        for chunk in mapped.chunks_exact(bpp) {
+            let color = decode_pixel(format, chunk)?;
             pixels.push(color);
         }
         self.ctx
-            .unmap_buffer(self.target.readback)
+            .unmap_buffer(readback)
             .map_err(|_| "failed to unmap readback buffer".to_string())?;
         image.pixels = pixels;
-        image.size = [PREVIEW_WIDTH, PREVIEW_HEIGHT];
+        image.size = [size[0] as usize, size[1] as usize];
         Ok(())
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct RenderTargetSignature {
+    render_pass: String,
+    width: u32,
+    height: u32,
+    color_format: Format,
+    depth_format: Option<Format>,
+    samples: SampleCount,
+}
+
+impl RenderTargetSignature {
+    fn from_layout(render_pass_key: &str, layout: &RenderPassLayout) -> Result<Self, String> {
+        let subpass = layout
+            .subpasses
+            .first()
+            .ok_or_else(|| "render pass has no subpasses".to_string())?;
+        let color_attachment = subpass
+            .color_attachments
+            .first()
+            .ok_or_else(|| "render pass has no color attachments".to_string())?;
+        let width = layout.viewport.area.w.max(1.0) as u32;
+        let height = layout.viewport.area.h.max(1.0) as u32;
+
+        Ok(Self {
+            render_pass: render_pass_key.to_string(),
+            width,
+            height,
+            color_format: color_attachment.format,
+            depth_format: subpass.depth_stencil_attachment.as_ref().map(|d| d.format),
+            samples: color_attachment.samples,
+        })
+    }
+}
+
 struct PreviewTarget {
-    color: Handle<dashi::Image>,
-    color_view: ImageView,
-    depth_view: ImageView,
+    color_images: Vec<Handle<dashi::Image>>,
+    color_views: [Option<ImageView>; 4],
+    _depth_image: Option<Handle<dashi::Image>>,
+    depth_view: Option<ImageView>,
     readback: Handle<dashi::Buffer>,
-    viewport: Viewport,
+    _viewport: Viewport,
+    size: [u32; 2],
+    format: Format,
+    _samples: SampleCount,
 }
 
 impl PreviewTarget {
-    fn new(ctx: &mut Context) -> Result<Self, String> {
-        let color = ctx
-            .make_image(&ImageInfo {
-                debug_name: "preview_color",
-                dim: [PREVIEW_WIDTH as u32, PREVIEW_HEIGHT as u32, 1],
-                layers: 1,
-                format: Format::RGBA8,
-                mip_levels: 1,
-                initial_data: None,
-                ..Default::default()
-            })
-            .map_err(|_| "failed to create color target".to_string())?;
-        let depth = ctx
-            .make_image(&ImageInfo {
-                debug_name: "preview_depth",
-                dim: [PREVIEW_WIDTH as u32, PREVIEW_HEIGHT as u32, 1],
-                layers: 1,
-                format: Format::D24S8,
-                mip_levels: 1,
-                initial_data: None,
-                ..Default::default()
-            })
-            .map_err(|_| "failed to create depth target".to_string())?;
+    fn new(
+        ctx: &mut Context,
+        signature: &RenderTargetSignature,
+        layout: &RenderPassLayout,
+    ) -> Result<Self, String> {
+        if signature.samples != SampleCount::S1 {
+            return Err("Preview only supports sample count 1".to_string());
+        }
 
-        let color_view = ImageView {
-            img: color,
-            range: Default::default(),
-            aspect: AspectMask::Color,
+        if bytes_per_pixel(signature.color_format).is_none() {
+            return Err(format!(
+                "Unsupported color format {:?} for preview",
+                signature.color_format
+            ));
+        }
+
+        let mut color_views: [Option<ImageView>; 4] = Default::default();
+        let mut color_images = Vec::new();
+        let subpass = layout
+            .subpasses
+            .first()
+            .ok_or_else(|| "render pass has no subpasses".to_string())?;
+
+        for (idx, attachment) in subpass.color_attachments.iter().take(4).enumerate() {
+            let img = ctx
+                .make_image(&ImageInfo {
+                    debug_name: "preview_color",
+                    dim: [signature.width, signature.height, 1],
+                    layers: 1,
+                    format: attachment.format,
+                    mip_levels: 1,
+                    samples: attachment.samples,
+                    initial_data: None,
+                })
+                .map_err(|_| "failed to create color target".to_string())?;
+            let view = ImageView {
+                img,
+                range: Default::default(),
+                aspect: AspectMask::Color,
+            };
+            color_images.push(img);
+            color_views[idx] = Some(view);
+        }
+
+        let depth_view = if let Some(depth_attachment) = &subpass.depth_stencil_attachment {
+            let img = ctx
+                .make_image(&ImageInfo {
+                    debug_name: "preview_depth",
+                    dim: [signature.width, signature.height, 1],
+                    layers: 1,
+                    format: depth_attachment.format,
+                    mip_levels: 1,
+                    samples: depth_attachment.samples,
+                    initial_data: None,
+                })
+                .map_err(|_| "failed to create depth target".to_string())?;
+            Some(ImageView {
+                img,
+                range: Default::default(),
+                aspect: AspectMask::DepthStencil,
+            })
+        } else {
+            None
         };
-        let depth_view = ImageView {
-            img: depth,
-            range: Default::default(),
-            aspect: AspectMask::DepthStencil,
-        };
+
+        let depth_image = depth_view.map(|view| view.img);
+
         let readback = ctx
             .make_buffer(&BufferInfo {
                 debug_name: "preview_readback",
-                byte_size: (PREVIEW_WIDTH * PREVIEW_HEIGHT * 4) as u32,
+                byte_size: (signature.width
+                    * signature.height
+                    * bytes_per_pixel(signature.color_format).unwrap() as u32),
                 visibility: MemoryVisibility::CpuAndGpu,
                 usage: BufferUsage::ALL,
                 initial_data: None,
@@ -750,28 +1048,22 @@ impl PreviewTarget {
             .map_err(|_| "failed to allocate readback buffer".to_string())?;
 
         let viewport = Viewport {
-            area: dashi::FRect2D {
-                x: 0.0,
-                y: 0.0,
-                w: PREVIEW_WIDTH as f32,
-                h: PREVIEW_HEIGHT as f32,
-            },
-            scissor: Rect2D {
-                x: 0,
-                y: 0,
-                w: PREVIEW_WIDTH as u32,
-                h: PREVIEW_HEIGHT as u32,
-            },
-            min_depth: 0.0,
-            max_depth: 1.0,
+            area: layout.viewport.area,
+            scissor: layout.viewport.scissor,
+            min_depth: layout.viewport.min_depth,
+            max_depth: layout.viewport.max_depth,
         };
 
         Ok(Self {
-            color,
-            color_view,
+            color_images,
+            color_views,
+            _depth_image: depth_image,
             depth_view,
             readback,
-            viewport,
+            _viewport: viewport,
+            size: [signature.width, signature.height],
+            format: signature.color_format,
+            _samples: signature.samples,
         })
     }
 }
@@ -781,80 +1073,103 @@ struct PreviewShaderSignature {
     key: String,
     vertex_hash: u64,
     fragment_hash: u64,
+    render_pass: String,
+    layout_hash: u64,
 }
 
 impl PreviewShaderSignature {
-    fn from_modules(label: &str, vertex: &ShaderModule, fragment: &ShaderModule) -> Self {
+    fn from_modules(
+        label: &str,
+        vertex: &ShaderModule,
+        fragment: &ShaderModule,
+        render_pass: &str,
+        layout_hash: u64,
+    ) -> Self {
         Self {
             key: label.to_string(),
             vertex_hash: hash_words(vertex.words()),
             fragment_hash: hash_words(fragment.words()),
+            render_pass: render_pass.to_string(),
+            layout_hash,
         }
     }
 }
 
 struct PreviewPipeline {
     pipeline: Handle<dashi::GraphicsPipeline>,
+    render_pass: Handle<dashi::RenderPass>,
+    viewport: Viewport,
+    bind_group_layout: Handle<BindGroupLayout>,
+    layout_hash: u64,
 }
 
-impl PreviewPipeline {
-    fn new(
-        ctx: &mut Context,
-        render_pass: Handle<dashi::RenderPass>,
-        bind_group_layout: Handle<BindGroupLayout>,
-        vertex: &ShaderModule,
-        fragment: &ShaderModule,
-        label: &str,
-    ) -> Result<Self, String> {
-        let vertex_info = VertexDescriptionInfo {
-            entries: &VERTEX_ENTRIES,
-            stride: std::mem::size_of::<Vertex>(),
-            rate: VertexRate::Vertex,
-        };
+fn hash_graphics_layout(layout: Option<&GraphicsShaderLayout>) -> u64 {
+    layout
+        .and_then(|layout| hash_json(layout).ok())
+        .unwrap_or_default()
+}
 
-        let shaders = [
-            PipelineShaderInfo {
-                stage: ShaderType::Vertex,
-                spirv: vertex.words(),
-                specialization: &[],
+fn hash_json<T: serde::Serialize>(value: &T) -> Result<u64, String> {
+    let serialized = serde_json::to_string(value).map_err(|err| err.to_string())?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    serialized.hash(&mut hasher);
+    Ok(hasher.finish())
+}
+
+fn bytes_per_pixel(format: Format) -> Option<usize> {
+    match format {
+        Format::RGBA8 | Format::RGBA8Unorm | Format::BGRA8Unorm => Some(4),
+        _ => None,
+    }
+}
+
+fn decode_pixel(format: Format, bytes: &[u8]) -> Result<Color32, String> {
+    match format {
+        Format::RGBA8 | Format::RGBA8Unorm => Ok(Color32::from_rgba_unmultiplied(
+            bytes[0], bytes[1], bytes[2], bytes[3],
+        )),
+        Format::BGRA8Unorm => Ok(Color32::from_rgba_unmultiplied(
+            bytes[2], bytes[1], bytes[0], bytes[3],
+        )),
+        other => Err(format!("Unsupported preview format {:?}", other)),
+    }
+}
+
+fn builtin_render_pass_layout() -> RenderPassLayout {
+    use noren::parsing::RenderSubpassLayout;
+
+    let color_attachment = AttachmentDescription {
+        format: Format::RGBA8,
+        ..Default::default()
+    };
+    let depth_attachment = AttachmentDescription {
+        format: Format::D24S8,
+        ..Default::default()
+    };
+
+    RenderPassLayout {
+        debug_name: Some("builtin_preview".to_string()),
+        viewport: Viewport {
+            area: dashi::FRect2D {
+                x: 0.0,
+                y: 0.0,
+                w: 320.0,
+                h: 240.0,
             },
-            PipelineShaderInfo {
-                stage: ShaderType::Fragment,
-                spirv: fragment.words(),
-                specialization: &[],
+            scissor: dashi::Rect2D {
+                x: 0,
+                y: 0,
+                w: 320,
+                h: 240,
             },
-        ];
-
-        let mut bg_layouts: [Option<Handle<BindGroupLayout>>; 4] = Default::default();
-        bg_layouts[0] = Some(bind_group_layout);
-
-        let layout = GraphicsPipelineLayoutInfo {
-            debug_name: label,
-            vertex_info,
-            bg_layouts,
-            bt_layouts: Default::default(),
-            shaders: &shaders,
-            details: GraphicsPipelineDetails {
-                depth_test: Some(DepthInfo {
-                    should_test: true,
-                    should_write: true,
-                }),
-                ..Default::default()
-            },
-        };
-
-        let pipeline_layout = ctx
-            .make_graphics_pipeline_layout(&layout)
-            .map_err(|_| "failed to build pipeline layout".to_string())?;
-        let pipeline = ctx
-            .make_graphics_pipeline(&GraphicsPipelineInfo {
-                debug_name: label,
-                layout: pipeline_layout,
-                render_pass,
-                subpass_id: 0,
-            })
-            .map_err(|_| "failed to build graphics pipeline".to_string())?;
-        Ok(Self { pipeline })
+            min_depth: 0.0,
+            max_depth: 1.0,
+        },
+        subpasses: vec![RenderSubpassLayout {
+            color_attachments: vec![color_attachment],
+            depth_stencil_attachment: Some(depth_attachment),
+            subpass_dependencies: Vec::new(),
+        }],
     }
 }
 
@@ -1142,37 +1457,41 @@ struct PreviewAssetCache {
     shaders: Option<ShaderDB>,
     leaks: HashMap<String, DatabaseEntry>,
     textures: HashMap<String, PreviewTextureHandle>,
+    render_passes: Option<RenderPassDB>,
+    render_pass_layouts: HashMap<String, RenderPassLayout>,
+    render_pass_count: usize,
 }
 
 impl PreviewAssetCache {
-    fn new(root: &Path, layout: &MaterialEditorDatabaseLayout) -> Self {
+    fn new(state: &MaterialEditorProjectState) -> Self {
         Self {
-            project_root: root.to_path_buf(),
-            layout: layout.clone(),
+            project_root: state.root().to_path_buf(),
+            layout: state.layout.clone(),
             imagery: None,
             shaders: None,
             leaks: HashMap::new(),
             textures: HashMap::new(),
+            render_passes: None,
+            render_pass_layouts: HashMap::new(),
+            render_pass_count: 0,
         }
     }
 
-    fn reset(&mut self, root: &Path, layout: &MaterialEditorDatabaseLayout) {
-        self.project_root = root.to_path_buf();
-        self.layout = layout.clone();
+    fn reset(&mut self, state: &MaterialEditorProjectState) {
+        self.project_root = state.root().to_path_buf();
+        self.layout = state.layout.clone();
         self.imagery = None;
         self.shaders = None;
         self.leaks.clear();
         self.textures.clear();
+        self.render_passes = None;
+        self.render_pass_layouts.clear();
+        self.render_pass_count = 0;
     }
 
-    fn ensure_imagery(
-        &mut self,
-        root: &Path,
-        layout: &MaterialEditorDatabaseLayout,
-        gpu: &mut PreviewGpu,
-    ) {
-        if self.project_root != root || self.layout_changed(layout) {
-            self.reset(root, layout);
+    fn ensure_imagery(&mut self, state: &MaterialEditorProjectState, gpu: &mut PreviewGpu) {
+        if self.project_root != state.root() || self.layout_changed(&state.layout) {
+            self.reset(state);
         }
         if self.imagery.is_none() {
             let path = self.project_root.join(&self.layout.imagery);
@@ -1183,9 +1502,9 @@ impl PreviewAssetCache {
         }
     }
 
-    fn ensure_shaders(&mut self, root: &Path, layout: &MaterialEditorDatabaseLayout) {
-        if self.project_root != root || self.layout_changed(layout) {
-            self.reset(root, layout);
+    fn ensure_shaders(&mut self, state: &MaterialEditorProjectState) {
+        if self.project_root != state.root() || self.layout_changed(&state.layout) {
+            self.reset(state);
         }
         if self.shaders.is_none() {
             let path = self.project_root.join(&self.layout.shaders);
@@ -1193,6 +1512,26 @@ impl PreviewAssetCache {
                 self.shaders = Some(ShaderDB::new(str_path));
             }
         }
+    }
+
+    fn ensure_render_passes(&mut self, state: &MaterialEditorProjectState) {
+        if self.project_root != state.root() || self.layout_changed(&state.layout) {
+            self.reset(state);
+        }
+
+        if self.render_passes.is_some() && self.render_pass_count == state.graph.render_passes.len()
+        {
+            return;
+        }
+
+        self.render_pass_layouts = state
+            .graph
+            .render_passes
+            .iter()
+            .map(|(id, pass)| (id.clone(), pass.resource.data.clone().into()))
+            .collect();
+        self.render_pass_count = state.graph.render_passes.len();
+        self.render_passes = Some(RenderPassDB::new(self.render_pass_layouts.clone()));
     }
 
     fn shader_modules(
