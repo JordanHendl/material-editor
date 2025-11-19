@@ -11,8 +11,8 @@ use dashi::{
     AspectMask, AttachmentDescription, BindGroupLayout, BindGroupLayoutInfo, BindGroupVariable,
     BindGroupVariableType, BindTableLayout, BindTableLayoutInfo, BufferInfo, BufferUsage,
     ClearValue, CommandQueueInfo2, Context, ContextInfo, DepthInfo, Format,
-    GraphicsPipelineDetails, GraphicsPipelineLayoutInfo, Handle, ImageInfo, ImageView,
-    MemoryVisibility, PipelineShaderInfo, SampleCount, ShaderPrimitiveType, ShaderType,
+    GraphicsPipelineDetails, GraphicsPipelineLayoutInfo, Handle, ImageInfo, ImageView, LoadOp,
+    MemoryVisibility, PipelineShaderInfo, SampleCount, ShaderPrimitiveType, ShaderType, StoreOp,
     VertexDescriptionInfo, VertexEntryInfo, VertexRate, Viewport,
     driver::command::{BeginRenderPass, CopyImageBuffer, DrawIndexed},
     gpu::CommandStream,
@@ -66,6 +66,15 @@ impl MaterialPreviewPanel {
             .default_open(true)
             .show(ui, |ui| {
                 self.draw_controls(ui);
+
+                let available = ui.available_size_before_wrap();
+                let width = available.x.max(1.0).floor() as u32;
+                let height = if available.y.is_finite() {
+                    available.y.max(1.0).floor() as u32
+                } else {
+                    self.renderer.preview_size[1] as u32
+                };
+                self.renderer.resize([width, height]);
 
                 let result = self.renderer.render(material_id, material, state);
                 self.update_texture(ui, result.image_changed);
@@ -160,6 +169,7 @@ struct PreviewRenderer {
     assets: PreviewAssetCache,
     image: ColorImage,
     preview_size: [usize; 2],
+    requested_size: [u32; 2],
     gpu: Option<PreviewGpu>,
     gpu_error: Option<String>,
 }
@@ -176,9 +186,15 @@ impl PreviewRenderer {
             assets: PreviewAssetCache::new(state),
             image: ColorImage::new([320, 240], Color32::BLACK),
             preview_size: [320, 240],
+            requested_size: [320, 240],
             gpu,
             gpu_error,
         }
+    }
+
+    fn resize(&mut self, size: [u32; 2]) {
+        let clamped = [size[0].max(1), size[1].max(1)];
+        self.requested_size = clamped;
     }
 
     fn sync_with_state(&mut self, state: &MaterialEditorProjectState) {
@@ -282,6 +298,10 @@ impl PreviewRenderer {
 
         let light_dir = Vec3::new(0.3, 0.8, 0.6).normalize();
 
+        let resized_render_pass_layout = render_pass_layout
+            .as_ref()
+            .map(|layout| resize_render_pass_layout(layout, self.requested_size));
+
         let render_result = gpu.render(
             mesh,
             &self.config,
@@ -291,12 +311,13 @@ impl PreviewRenderer {
             &mut self.image,
             shader_layout.as_ref(),
             render_pass_key,
-            render_pass_layout.as_ref(),
+            resized_render_pass_layout,
             &shader_label,
             shader_modules
                 .as_ref()
                 .map(|modules| (&modules.vertex, &modules.fragment)),
             &mut self.assets,
+            self.requested_size,
         );
 
         if let Err(err) = render_result {
@@ -476,7 +497,7 @@ impl PreviewGpu {
         bind_groups.insert("fallback".to_string(), bind_group);
 
         let builtin_shader = builtin_shader_modules()?;
-        let builtin_render_pass = builtin_render_pass_layout();
+        let builtin_render_pass = builtin_render_pass_layout([320, 240]);
         let mut render_passes = HashMap::new();
         render_passes.insert("builtin_preview".to_string(), builtin_render_pass.clone());
         let builtin_render_pass_db = RenderPassDB::new(render_passes);
@@ -511,15 +532,19 @@ impl PreviewGpu {
         image: &mut ColorImage,
         shader_layout: Option<&GraphicsShaderLayout>,
         render_pass_key: Option<String>,
-        render_pass_layout: Option<&RenderPassLayout>,
+        render_pass_layout: Option<RenderPassLayout>,
         shader_label: &str,
         shader_modules: Option<(&ShaderModule, &ShaderModule)>,
         assets: &mut PreviewAssetCache,
+        target_size: [u32; 2],
     ) -> Result<(), String> {
         let render_pass_key = render_pass_key.unwrap_or_else(|| "builtin_preview".to_string());
-        let render_pass_layout = render_pass_layout
-            .cloned()
-            .unwrap_or_else(|| self.builtin_render_pass.clone());
+        if render_pass_key == "builtin_preview" {
+            self.ensure_builtin_render_pass(target_size);
+        }
+
+        let base_layout = render_pass_layout.unwrap_or_else(|| self.builtin_render_pass.clone());
+        let render_pass_layout = resize_render_pass_layout(&base_layout, target_size);
         self.ensure_pipeline(
             shader_label,
             shader_layout,
@@ -742,6 +767,8 @@ impl PreviewGpu {
                 layout_hash,
             });
             self.pipeline_signature = Some(signature);
+        } else if let Some(pipeline) = self.pipeline.as_mut() {
+            pipeline.viewport = render_pass_layout.viewport;
         }
         Ok(())
     }
@@ -857,6 +884,26 @@ impl PreviewGpu {
             self.target_signature = Some(signature);
         }
         Ok(())
+    }
+
+    fn ensure_builtin_render_pass(&mut self, size: [u32; 2]) {
+        let current_size = [
+            self.builtin_render_pass.viewport.area.w as u32,
+            self.builtin_render_pass.viewport.area.h as u32,
+        ];
+        if current_size != size {
+            self.builtin_render_pass = builtin_render_pass_layout(size);
+            let mut render_passes = HashMap::new();
+            render_passes.insert(
+                "builtin_preview".to_string(),
+                self.builtin_render_pass.clone(),
+            );
+            self.builtin_render_pass_db = RenderPassDB::new(render_passes);
+            self.target = None;
+            self.target_signature = None;
+            self.pipeline = None;
+            self.pipeline_signature = None;
+        }
     }
 
     fn update_uniforms(
@@ -1135,16 +1182,33 @@ fn decode_pixel(format: Format, bytes: &[u8]) -> Result<Color32, String> {
     }
 }
 
-fn builtin_render_pass_layout() -> RenderPassLayout {
+fn resize_render_pass_layout(layout: &RenderPassLayout, size: [u32; 2]) -> RenderPassLayout {
+    let mut layout = layout.clone();
+    layout.viewport.area.w = size[0] as f32;
+    layout.viewport.area.h = size[1] as f32;
+    layout.viewport.scissor.w = size[0];
+    layout.viewport.scissor.h = size[1];
+    layout
+}
+
+fn builtin_render_pass_layout(size: [u32; 2]) -> RenderPassLayout {
     use noren::parsing::RenderSubpassLayout;
 
     let color_attachment = AttachmentDescription {
         format: Format::RGBA8,
-        ..Default::default()
+        load_op: LoadOp::Clear,
+        store_op: StoreOp::Store,
+        samples: SampleCount::S1,
+        stencil_load_op: LoadOp::DontCare,
+        stencil_store_op: StoreOp::DontCare,
     };
     let depth_attachment = AttachmentDescription {
         format: Format::D24S8,
-        ..Default::default()
+        load_op: LoadOp::Clear,
+        store_op: StoreOp::DontCare,
+        samples: SampleCount::S1,
+        stencil_load_op: LoadOp::DontCare,
+        stencil_store_op: StoreOp::DontCare,
     };
 
     RenderPassLayout {
@@ -1153,14 +1217,14 @@ fn builtin_render_pass_layout() -> RenderPassLayout {
             area: dashi::FRect2D {
                 x: 0.0,
                 y: 0.0,
-                w: 320.0,
-                h: 240.0,
+                w: size[0] as f32,
+                h: size[1] as f32,
             },
             scissor: dashi::Rect2D {
                 x: 0,
                 y: 0,
-                w: 320,
-                h: 240,
+                w: size[0],
+                h: size[1],
             },
             min_depth: 0.0,
             max_depth: 1.0,
