@@ -683,7 +683,7 @@ dependencies = [
 [[package]]
 name = "dashi"
 version = "0.1.0"
-source = "git+https://github.com/JordanHendl/dashi#14c68b85a4b15660dbd17c3917f215aa3e3d27fa"
+source = "git+https://github.com/JordanHendl/dashi#253b872a39a50da2f2206bf2bed162ff9a9ade26"
 dependencies = [
  "anyhow",
  "ash",
@@ -1310,11 +1310,11 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "home"
-version = "0.5.12"
+version = "0.5.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
+checksum = "589533453244b0995c858700322199b2becb13b627df2851f64a2775d024abcf"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1910,7 +1910,7 @@ checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
 [[package]]
 name = "noren"
 version = "0.1.0"
-source = "git+https://github.com/JordanHendl/noren#1c3a4e8b3b184d709866a4a81f11ead471915686"
+source = "git+https://github.com/JordanHendl/noren#eb268cdfb905f40995183686009b94733018aebc"
 dependencies = [
  "bincode",
  "bytemuck",
