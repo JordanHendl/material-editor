@@ -10,11 +10,11 @@ use dashi::gpu::execution::CommandRing;
 use dashi::{
     AspectMask, AttachmentDescription, BindGroupLayout, BindGroupLayoutInfo, BindGroupVariable,
     BindGroupVariableType, BindTableLayout, BindTableLayoutInfo, BufferInfo, BufferUsage,
-    ClearValue, CommandQueueInfo2, Context, ContextInfo, DepthInfo, Format,
+    ClearValue, CommandQueueInfo2, Context, ContextInfo, DepthInfo, Filter, Format,
     GraphicsPipelineDetails, GraphicsPipelineLayoutInfo, Handle, ImageInfo, ImageView,
-    MemoryVisibility, PipelineShaderInfo, SampleCount, ShaderPrimitiveType, ShaderType,
+    MemoryVisibility, PipelineShaderInfo, Rect2D, SampleCount, ShaderPrimitiveType, ShaderType,
     VertexDescriptionInfo, VertexEntryInfo, VertexRate, Viewport,
-    driver::command::{BeginRenderPass, CopyImageBuffer, DrawIndexed},
+    driver::command::{BeginRenderPass, BlitImage, CopyImageBuffer, DrawIndexed},
     gpu::CommandStream,
 };
 use eframe::egui::{self, Color32, ColorImage};
@@ -66,6 +66,8 @@ impl MaterialPreviewPanel {
             .default_open(true)
             .show(ui, |ui| {
                 self.draw_controls(ui);
+
+                self.renderer.request_preview_size(ui.available_width());
 
                 let result = self.renderer.render(material_id, material, state);
                 self.update_texture(ui, result.image_changed);
@@ -160,6 +162,7 @@ struct PreviewRenderer {
     assets: PreviewAssetCache,
     image: ColorImage,
     preview_size: [usize; 2],
+    pending_size: Option<[u32; 2]>,
     gpu: Option<PreviewGpu>,
     gpu_error: Option<String>,
 }
@@ -176,6 +179,7 @@ impl PreviewRenderer {
             assets: PreviewAssetCache::new(state),
             image: ColorImage::new([320, 240], Color32::BLACK),
             preview_size: [320, 240],
+            pending_size: None,
             gpu,
             gpu_error,
         }
@@ -183,6 +187,16 @@ impl PreviewRenderer {
 
     fn sync_with_state(&mut self, state: &MaterialEditorProjectState) {
         self.assets.reset(state);
+    }
+
+    fn request_preview_size(&mut self, available_width: f32) {
+        let aspect = self.preview_size[1].max(1) as f32 / self.preview_size[0].max(1) as f32;
+        let width = available_width.max(1.0).ceil() as u32;
+        let height = (width as f32 * aspect).ceil().max(1.0) as u32;
+        let requested = [width.max(1), height.max(1)];
+        if self.pending_size.as_ref() != Some(&requested) {
+            self.pending_size = Some(requested);
+        }
     }
 
     fn render(
@@ -232,8 +246,8 @@ impl PreviewRenderer {
                     let layout: GraphicsShaderLayout = shader.resource.data.clone().into();
                     render_pass_key = layout.render_pass.clone();
                     if let Some(pass_key) = &render_pass_key {
-                        if let Some(pass_layout) = self.assets.render_pass_layouts.get(pass_key) {
-                            render_pass_layout = Some(pass_layout.clone());
+                        if let Some(pass_layout) = self.assets.render_pass_layout(pass_key) {
+                            render_pass_layout = Some(pass_layout);
                         } else {
                             warnings.push(format!("Render pass '{pass_key}' is missing"));
                         }
@@ -282,6 +296,12 @@ impl PreviewRenderer {
 
         let light_dir = Vec3::new(0.3, 0.8, 0.6).normalize();
 
+        let requested_size = self.pending_size.take();
+        let preview_size = requested_size.unwrap_or([
+            self.preview_size[0].max(1) as u32,
+            self.preview_size[1].max(1) as u32,
+        ]);
+
         let render_result = gpu.render(
             mesh,
             &self.config,
@@ -291,11 +311,12 @@ impl PreviewRenderer {
             &mut self.image,
             shader_layout.as_ref(),
             render_pass_key,
-            render_pass_layout.as_ref(),
+            render_pass_layout,
             &shader_label,
             shader_modules
                 .as_ref()
                 .map(|modules| (&modules.vertex, &modules.fragment)),
+            preview_size,
             &mut self.assets,
         );
 
@@ -424,7 +445,7 @@ struct PreviewGpu {
     ctx: Context,
     ring: CommandRing,
     target: Option<PreviewTarget>,
-    target_signature: Option<RenderTargetSignature>,
+    target_signature: Option<PreviewTargetSignature>,
     pipeline: Option<PreviewPipeline>,
     pipeline_signature: Option<PreviewShaderSignature>,
     sampler: Handle<dashi::Sampler>,
@@ -511,15 +532,14 @@ impl PreviewGpu {
         image: &mut ColorImage,
         shader_layout: Option<&GraphicsShaderLayout>,
         render_pass_key: Option<String>,
-        render_pass_layout: Option<&RenderPassLayout>,
+        render_pass_layout: Option<RenderPassLayout>,
         shader_label: &str,
         shader_modules: Option<(&ShaderModule, &ShaderModule)>,
+        preview_size: [u32; 2],
         assets: &mut PreviewAssetCache,
     ) -> Result<(), String> {
         let render_pass_key = render_pass_key.unwrap_or_else(|| "builtin_preview".to_string());
-        let render_pass_layout = render_pass_layout
-            .cloned()
-            .unwrap_or_else(|| self.builtin_render_pass.clone());
+        let render_pass_layout = render_pass_layout.unwrap_or_else(|| self.builtin_render_pass.clone());
         self.ensure_pipeline(
             shader_label,
             shader_layout,
@@ -528,7 +548,7 @@ impl PreviewGpu {
             shader_modules,
             assets,
         )?;
-        self.ensure_target(&render_pass_key, &render_pass_layout)?;
+        self.ensure_target(&render_pass_key, &render_pass_layout, preview_size)?;
         let pipeline_snapshot = {
             let pipeline = self
                 .pipeline
@@ -555,14 +575,24 @@ impl PreviewGpu {
             (
                 color_image,
                 target.readback,
+                target.preview_image,
                 target.color_views,
                 target.depth_view,
                 target.size,
+                target.preview_size,
                 target.format,
             )
         };
-        let (color_image, readback, color_views, depth_view, target_size, target_format) =
-            target_snapshot;
+        let (
+            color_image,
+            readback,
+            preview_image,
+            color_views,
+            depth_view,
+            target_size,
+            preview_size,
+            target_format,
+        ) = target_snapshot;
         let (pipeline_handle, bind_group_layout, layout_hash, render_pass_handle, viewport) =
             pipeline_snapshot;
         self.update_uniforms(config, light_dir, has_texture, target_size)?;
@@ -605,8 +635,29 @@ impl PreviewGpu {
                 let pending = drawing.unbind_graphics_pipeline();
                 let mut recording = pending.stop_drawing();
 
-                let copy = CopyImageBuffer {
+                let blit = BlitImage {
                     src: color_image,
+                    dst: preview_image,
+                    src_range: Default::default(),
+                    dst_range: Default::default(),
+                    filter: Filter::Linear,
+                    src_region: Rect2D {
+                        x: 0,
+                        y: 0,
+                        w: target_size[0],
+                        h: target_size[1],
+                    },
+                    dst_region: Rect2D {
+                        x: 0,
+                        y: 0,
+                        w: preview_size[0],
+                        h: preview_size[1],
+                    },
+                };
+                recording.blit_images(&blit);
+
+                let copy = CopyImageBuffer {
+                    src: preview_image,
                     dst: readback,
                     range: Default::default(),
                     dst_offset: 0,
@@ -624,7 +675,7 @@ impl PreviewGpu {
             .wait_all()
             .map_err(|err| format!("failed to wait for preview commands: {err}"))?;
 
-        self.readback(readback, target_size, target_format, image)?;
+        self.readback(readback, preview_size, target_format, image)?;
         Ok(())
     }
 
@@ -660,7 +711,13 @@ impl PreviewGpu {
             render_pass_key,
             layout_hash,
         );
-        if self.pipeline_signature.as_ref() != Some(&signature) {
+        let viewport_changed = self
+            .pipeline
+            .as_ref()
+            .map(|existing| !viewport_matches(&existing.viewport, &render_pass_layout.viewport))
+            .unwrap_or(true);
+
+        if viewport_changed || self.pipeline_signature.as_ref() != Some(&signature) {
             let (bg_layouts, bt_layouts, active_bind_group) =
                 self.build_layout_handles(shader_layout)?;
             let vertex_info = VertexDescriptionInfo {
@@ -710,24 +767,30 @@ impl PreviewGpu {
                 .make_graphics_pipeline_layout(&layout_info)
                 .map_err(|_| "failed to build pipeline layout".to_string())?;
 
-            let pass_db = if render_pass_key == "builtin_preview" {
-                &mut self.builtin_render_pass_db
+            let pipeline_info = if render_pass_key == "builtin_preview" {
+                self.builtin_render_pass_db
+                    .pipeline_info(
+                        render_pass_key,
+                        subpass_id,
+                        pipeline_layout,
+                        label.as_str(),
+                        &mut self.ctx,
+                    )
+                    .map_err(|err| format!("failed to prepare pipeline info: {err}"))?
             } else {
-                assets
-                    .render_passes
-                    .as_mut()
-                    .ok_or_else(|| "render pass database unavailable".to_string())?
+                let pass_db = assets
+                    .render_pass_db()
+                    .ok_or_else(|| "render pass database unavailable".to_string())?;
+                pass_db
+                    .pipeline_info(
+                        render_pass_key,
+                        subpass_id,
+                        pipeline_layout,
+                        label.as_str(),
+                        &mut self.ctx,
+                    )
+                    .map_err(|err| format!("failed to prepare pipeline info: {err}"))?
             };
-
-            let pipeline_info = pass_db
-                .pipeline_info(
-                    render_pass_key,
-                    subpass_id,
-                    pipeline_layout,
-                    label.as_str(),
-                    &mut self.ctx,
-                )
-                .map_err(|err| format!("failed to prepare pipeline info: {err}"))?;
 
             let pipeline = self
                 .ctx
@@ -849,8 +912,10 @@ impl PreviewGpu {
         &mut self,
         render_pass_key: &str,
         render_pass_layout: &RenderPassLayout,
+        preview_size: [u32; 2],
     ) -> Result<(), String> {
-        let signature = RenderTargetSignature::from_layout(render_pass_key, render_pass_layout)?;
+        let signature =
+            PreviewTargetSignature::from_layout(render_pass_key, render_pass_layout, preview_size)?;
         if self.target_signature.as_ref() != Some(&signature) {
             let target = PreviewTarget::new(&mut self.ctx, &signature, render_pass_layout)?;
             self.target = Some(target);
@@ -955,14 +1020,49 @@ impl RenderTargetSignature {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct PreviewTargetSignature {
+    render: RenderTargetSignature,
+    preview_width: u32,
+    preview_height: u32,
+}
+
+impl PreviewTargetSignature {
+    fn from_layout(
+        render_pass_key: &str,
+        layout: &RenderPassLayout,
+        preview_size: [u32; 2],
+    ) -> Result<Self, String> {
+        let render = RenderTargetSignature::from_layout(render_pass_key, layout)?;
+        Ok(Self {
+            render,
+            preview_width: preview_size[0].max(1),
+            preview_height: preview_size[1].max(1),
+        })
+    }
+}
+
+fn viewport_matches(a: &Viewport, b: &Viewport) -> bool {
+    a.area.x == b.area.x
+        && a.area.y == b.area.y
+        && a.area.w == b.area.w
+        && a.area.h == b.area.h
+        && a.scissor == b.scissor
+        && a.min_depth == b.min_depth
+        && a.max_depth == b.max_depth
+}
+
 struct PreviewTarget {
     color_images: Vec<Handle<dashi::Image>>,
     color_views: [Option<ImageView>; 4],
     _depth_image: Option<Handle<dashi::Image>>,
     depth_view: Option<ImageView>,
+    preview_image: Handle<dashi::Image>,
+    preview_view: ImageView,
     readback: Handle<dashi::Buffer>,
     _viewport: Viewport,
     size: [u32; 2],
+    preview_size: [u32; 2],
     format: Format,
     _samples: SampleCount,
 }
@@ -970,17 +1070,17 @@ struct PreviewTarget {
 impl PreviewTarget {
     fn new(
         ctx: &mut Context,
-        signature: &RenderTargetSignature,
+        signature: &PreviewTargetSignature,
         layout: &RenderPassLayout,
     ) -> Result<Self, String> {
-        if signature.samples != SampleCount::S1 {
+        if signature.render.samples != SampleCount::S1 {
             return Err("Preview only supports sample count 1".to_string());
         }
 
-        if bytes_per_pixel(signature.color_format).is_none() {
+        if bytes_per_pixel(signature.render.color_format).is_none() {
             return Err(format!(
                 "Unsupported color format {:?} for preview",
-                signature.color_format
+                signature.render.color_format
             ));
         }
 
@@ -995,7 +1095,7 @@ impl PreviewTarget {
             let img = ctx
                 .make_image(&ImageInfo {
                     debug_name: "preview_color",
-                    dim: [signature.width, signature.height, 1],
+                    dim: [signature.render.width, signature.render.height, 1],
                     layers: 1,
                     format: attachment.format,
                     mip_levels: 1,
@@ -1016,7 +1116,7 @@ impl PreviewTarget {
             let img = ctx
                 .make_image(&ImageInfo {
                     debug_name: "preview_depth",
-                    dim: [signature.width, signature.height, 1],
+                    dim: [signature.render.width, signature.render.height, 1],
                     layers: 1,
                     format: depth_attachment.format,
                     mip_levels: 1,
@@ -1035,12 +1135,29 @@ impl PreviewTarget {
 
         let depth_image = depth_view.map(|view| view.img);
 
+        let preview_image = ctx
+            .make_image(&ImageInfo {
+                debug_name: "preview_readback_image",
+                dim: [signature.preview_width, signature.preview_height, 1],
+                layers: 1,
+                format: signature.render.color_format,
+                mip_levels: 1,
+                samples: SampleCount::S1,
+                initial_data: None,
+            })
+            .map_err(|_| "failed to create preview image".to_string())?;
+        let preview_view = ImageView {
+            img: preview_image,
+            range: Default::default(),
+            aspect: AspectMask::Color,
+        };
+
         let readback = ctx
             .make_buffer(&BufferInfo {
                 debug_name: "preview_readback",
-                byte_size: (signature.width
-                    * signature.height
-                    * bytes_per_pixel(signature.color_format).unwrap() as u32),
+                byte_size: (signature.preview_width
+                    * signature.preview_height
+                    * bytes_per_pixel(signature.render.color_format).unwrap() as u32),
                 visibility: MemoryVisibility::CpuAndGpu,
                 usage: BufferUsage::ALL,
                 initial_data: None,
@@ -1059,11 +1176,14 @@ impl PreviewTarget {
             color_views,
             _depth_image: depth_image,
             depth_view,
+            preview_image,
+            preview_view,
             readback,
             _viewport: viewport,
-            size: [signature.width, signature.height],
-            format: signature.color_format,
-            _samples: signature.samples,
+            size: [signature.render.width, signature.render.height],
+            preview_size: [signature.preview_width, signature.preview_height],
+            format: signature.render.color_format,
+            _samples: signature.render.samples,
         })
     }
 }
@@ -1519,11 +1639,6 @@ impl PreviewAssetCache {
             self.reset(state);
         }
 
-        if self.render_passes.is_some() && self.render_pass_count == state.graph.render_passes.len()
-        {
-            return;
-        }
-
         self.render_pass_layouts = state
             .graph
             .render_passes
@@ -1532,6 +1647,14 @@ impl PreviewAssetCache {
             .collect();
         self.render_pass_count = state.graph.render_passes.len();
         self.render_passes = Some(RenderPassDB::new(self.render_pass_layouts.clone()));
+    }
+
+    fn render_pass_layout(&self, key: &str) -> Option<RenderPassLayout> {
+        self.render_pass_layouts.get(key).cloned()
+    }
+
+    fn render_pass_db(&mut self) -> Option<&mut RenderPassDB> {
+        self.render_passes.as_mut()
     }
 
     fn shader_modules(
