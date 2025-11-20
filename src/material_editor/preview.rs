@@ -1047,7 +1047,10 @@ impl PreviewGpu {
                 })
                 .collect();
 
-            let update = BindTableUpdateInfo { table, bindings: &bindings };
+            let update = BindTableUpdateInfo {
+                table,
+                bindings: &bindings,
+            };
             self.ctx
                 .update_bind_table(&update)
                 .map_err(|err| format!("failed to update bind table: {err}"))?;
@@ -2033,4 +2036,63 @@ fn create_bind_group(
         set: 0,
     })
     .map_err(|err| format!("failed to create bind group: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::material_editor::project::MaterialEditorProjectLoader;
+
+    #[test]
+    fn renders_gpu_preview_and_copies_to_cpu() {
+        if std::env::var("RUN_PREVIEW_GPU_TEST").as_deref() != Ok("1") {
+            eprintln!("skipping GPU preview test (set RUN_PREVIEW_GPU_TEST=1 to enable)");
+            return;
+        }
+
+        unsafe {
+            std::env::set_var(
+                "VK_ICD_FILENAMES",
+                "/usr/share/vulkan/icd.d/lvp_icd.x86_64.json",
+            );
+        }
+
+        let sample_root = PathBuf::from("sample/db");
+        let state =
+            MaterialEditorProjectLoader::load_blocking(&sample_root).expect("load sample project");
+
+        let material_id = "material/multi_bind";
+        let material = state
+            .graph
+            .materials
+            .get(material_id)
+            .expect("sample material present")
+            .resource
+            .data
+            .clone();
+
+        let mut renderer = PreviewRenderer::new(&state);
+        renderer.request_preview_size(64.0);
+
+        let result = renderer.render(material_id, &material, &state);
+        assert!(
+            result.warnings.is_empty(),
+            "warnings during preview: {:?}",
+            result.warnings
+        );
+        assert!(
+            result.image_changed,
+            "preview renderer should output an updated image"
+        );
+
+        let image = renderer.image();
+        assert_eq!(image.size, [64, 48]);
+        assert_eq!(image.pixels.len(), image.size[0] * image.size[1]);
+        assert!(
+            image.pixels.iter().any(|&pixel| pixel != Color32::BLACK),
+            "gpu preview should write visible color data",
+        );
+    }
 }
