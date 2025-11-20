@@ -6,7 +6,11 @@ use std::{
 };
 
 use bytemuck::{Pod, Zeroable};
+use dashi::builders::BindTableBuilder;
 use dashi::gpu::execution::CommandRing;
+use dashi::gpu::vulkan::structs::{
+    BindTableUpdateInfo, IndexedBindingInfo, IndexedResource, ShaderResource,
+};
 use dashi::{
     AspectMask, AttachmentDescription, BindGroupLayout, BindGroupLayoutInfo, BindGroupVariable,
     BindGroupVariableType, BindTableLayout, BindTableLayoutInfo, BufferInfo, BufferUsage,
@@ -316,6 +320,7 @@ impl PreviewRenderer {
             shader_modules
                 .as_ref()
                 .map(|modules| (&modules.vertex, &modules.fragment)),
+            &resolved,
             preview_size,
             &mut self.assets,
         );
@@ -348,7 +353,7 @@ impl PreviewRenderer {
         let layout = layout?;
         let slots = texture_binding_slots(layout);
         let mut handles = Vec::with_capacity(slots.len());
-        let mut bindless_ids = Vec::new();
+        let mut bindless = Vec::new();
         for (index, slot) in slots.iter().enumerate() {
             let binding = material.textures.get(index).cloned().unwrap_or_default();
             match slot.kind {
@@ -383,11 +388,29 @@ impl PreviewRenderer {
                     }
                 }
                 TextureBindingKind::BindTable { .. } => {
+                    let mut texture = None;
                     let numeric_id = binding
                         .as_bindless()
                         .or_else(|| binding.value())
                         .map(|reference| {
-                            if !state.graph.textures.contains_key(reference) {
+                            if let Some(GraphTexture { resource }) =
+                                state.graph.textures.get(reference)
+                            {
+                                let image_entry = resource.data.image.clone();
+                                if image_entry.is_empty() {
+                                    warnings.push(format!(
+                                        "Texture '{}' does not reference imagery",
+                                        reference
+                                    ));
+                                } else if let Some(handle) = self.assets.texture(&image_entry) {
+                                    texture = Some(handle);
+                                } else {
+                                    warnings.push(format!(
+                                        "Failed to load imagery '{}' for texture '{}'",
+                                        image_entry, reference
+                                    ));
+                                }
+                            } else {
                                 warnings
                                     .push(format!("Bindless reference '{}' is missing", reference));
                             }
@@ -401,7 +424,19 @@ impl PreviewRenderer {
                             })
                         })
                         .unwrap_or_default();
-                    bindless_ids.push(numeric_id);
+                    bindless.push(BindlessSlot {
+                        table: match slot.kind {
+                            TextureBindingKind::BindTable { table, .. } => table,
+                            TextureBindingKind::BindGroup { .. } => unreachable!(),
+                        },
+                        binding: match slot.kind {
+                            TextureBindingKind::BindTable { binding, .. } => binding,
+                            TextureBindingKind::BindGroup { .. } => unreachable!(),
+                        },
+                        element: slot.element,
+                        id: numeric_id,
+                        texture,
+                    });
                     handles.push(None);
                 }
             }
@@ -409,7 +444,7 @@ impl PreviewRenderer {
         Some(ResolvedTextureBindings {
             slots,
             descriptor_bindings: handles,
-            bindless_ids,
+            bindless,
         })
     }
 
@@ -438,7 +473,16 @@ struct PreviewResult {
 struct ResolvedTextureBindings {
     slots: Vec<TextureBindingSlot>,
     descriptor_bindings: Vec<Option<PreviewTextureHandle>>,
-    bindless_ids: Vec<u32>,
+    bindless: Vec<BindlessSlot>,
+}
+
+#[derive(Clone)]
+struct BindlessSlot {
+    table: usize,
+    binding: u32,
+    element: u32,
+    id: u32,
+    texture: Option<PreviewTextureHandle>,
 }
 
 struct PreviewGpu {
@@ -452,6 +496,7 @@ struct PreviewGpu {
     uniform_buffer: Handle<dashi::Buffer>,
     fallback_texture: PreviewTextureHandle,
     bind_groups: HashMap<String, Handle<dashi::BindGroup>>,
+    bind_tables: HashMap<u64, Handle<dashi::BindTable>>,
     builtin_shader: BuiltinShader,
     fallback_bind_group_layout: Handle<BindGroupLayout>,
     bind_group_layouts: HashMap<u64, Handle<BindGroupLayout>>,
@@ -513,6 +558,7 @@ impl PreviewGpu {
             uniform_buffer,
             fallback_texture,
             bind_groups,
+            bind_tables: HashMap::new(),
             builtin_shader,
             fallback_bind_group_layout,
             bind_group_layouts: HashMap::new(),
@@ -535,11 +581,13 @@ impl PreviewGpu {
         render_pass_layout: Option<RenderPassLayout>,
         shader_label: &str,
         shader_modules: Option<(&ShaderModule, &ShaderModule)>,
+        resolved: &ResolvedTextureBindings,
         preview_size: [u32; 2],
         assets: &mut PreviewAssetCache,
     ) -> Result<(), String> {
         let render_pass_key = render_pass_key.unwrap_or_else(|| "builtin_preview".to_string());
-        let render_pass_layout = render_pass_layout.unwrap_or_else(|| self.builtin_render_pass.clone());
+        let render_pass_layout =
+            render_pass_layout.unwrap_or_else(|| self.builtin_render_pass.clone());
         self.ensure_pipeline(
             shader_label,
             shader_layout,
@@ -595,6 +643,9 @@ impl PreviewGpu {
         ) = target_snapshot;
         let (pipeline_handle, bind_group_layout, layout_hash, render_pass_handle, viewport) =
             pipeline_snapshot;
+        if render_pass_layout.is_some() {
+            self.update_bind_tables(shader_layout, resolved, mesh)?;
+        }
         self.update_uniforms(config, light_dir, has_texture, target_size)?;
         let resolved_texture = match texture {
             Some(handle) => handle,
@@ -887,6 +938,121 @@ impl PreviewGpu {
         Ok(handle)
     }
 
+    fn bind_table_for(
+        &mut self,
+        layout: Handle<BindTableLayout>,
+        table_index: usize,
+    ) -> Result<Handle<dashi::BindTable>, String> {
+        let key =
+            ((layout.slot as u64) << 32) | ((layout.generation as u64) << 16) | table_index as u64;
+        if let Some(existing) = self.bind_tables.get(&key) {
+            return Ok(*existing);
+        }
+
+        let handle = BindTableBuilder::new("preview_bind_table")
+            .layout(layout)
+            .set(table_index as u32)
+            .build(&mut self.ctx)
+            .map_err(|err| format!("failed to create bind table: {err}"))?;
+        self.bind_tables.insert(key, handle);
+        Ok(handle)
+    }
+
+    fn update_bind_tables(
+        &mut self,
+        layout: Option<&GraphicsShaderLayout>,
+        resolved: &ResolvedTextureBindings,
+        mesh: &GpuPreviewMesh,
+    ) -> Result<(), String> {
+        let Some(layout) = layout else {
+            return Ok(());
+        };
+
+        for (idx, cfg_opt) in layout.bind_table_layouts.iter().enumerate().take(4) {
+            let Some(cfg) = cfg_opt else { continue };
+            let table_handle = self.bind_table_layout_handle(cfg)?;
+            let table = self.bind_table_for(table_handle, idx)?;
+
+            let slots: Vec<&BindlessSlot> = resolved
+                .bindless
+                .iter()
+                .filter(|slot| slot.table == idx)
+                .collect();
+            if slots.is_empty() {
+                continue;
+            }
+
+            let mut resource_sets: Vec<Vec<IndexedResource>> = Vec::new();
+            let mut bindings: Vec<IndexedBindingInfo<'_>> = Vec::new();
+
+            for (binding, group) in slots.iter().fold(
+                HashMap::<u32, Vec<&BindlessSlot>>::new(),
+                |mut acc, slot| {
+                    acc.entry(slot.binding).or_default().push(*slot);
+                    acc
+                },
+            ) {
+                let var_type = binding_type(cfg, binding).ok_or_else(|| {
+                    format!(
+                        "Bindless binding {} has no matching shader variable",
+                        binding
+                    )
+                })?;
+
+                let mut resources = Vec::new();
+                for slot in group {
+                    let resource = match var_type {
+                        BindGroupVariableType::SampledImage
+                        | BindGroupVariableType::StorageImage => {
+                            let texture = slot.texture.clone().ok_or_else(|| {
+                                format!("Bindless texture {} is unavailable", slot.id)
+                            })?;
+                            ShaderResource::SampledImage(texture.view, self.sampler)
+                        }
+                        BindGroupVariableType::StorageBuffer
+                        | BindGroupVariableType::DynamicStorage => {
+                            let handle = if slot.element == 0 {
+                                mesh.vertex_buffer
+                            } else {
+                                mesh.index_buffer
+                            };
+                            ShaderResource::StorageBuffer(handle)
+                        }
+                        _ => {
+                            let handle = if slot.element == 0 {
+                                mesh.vertex_buffer
+                            } else {
+                                mesh.index_buffer
+                            };
+                            ShaderResource::Buffer(handle)
+                        }
+                    };
+                    resources.push(IndexedResource {
+                        resource,
+                        slot: slot.id,
+                    });
+                }
+
+                resource_sets.push(resources);
+                let resources_ref = resource_sets.last().expect("resources just pushed");
+                bindings.push(IndexedBindingInfo {
+                    binding,
+                    resources: resources_ref,
+                });
+            }
+
+            let update = BindTableUpdateInfo {
+                table,
+                bindings: &bindings,
+            };
+            self.ctx
+                .update_bind_table(&update)
+                .map_err(|err| format!("failed to update bind table: {err}"))?;
+        }
+
+        Ok(())
+    }
+
     fn bind_group_for(
         &mut self,
         texture: &PreviewTextureHandle,
@@ -984,6 +1150,17 @@ impl PreviewGpu {
         image.size = [size[0] as usize, size[1] as usize];
         Ok(())
     }
+}
+
+fn binding_type(
+    cfg: &dashi::cfg::BindTableLayoutCfg,
+    binding: u32,
+) -> Option<BindGroupVariableType> {
+    cfg.shaders
+        .iter()
+        .flat_map(|shader| shader.variables.iter())
+        .find(|var| var.binding == binding)
+        .map(|var| var.var_type)
 }
 
 #[derive(Clone, PartialEq, Eq)]
