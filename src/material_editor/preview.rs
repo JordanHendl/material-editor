@@ -586,8 +586,10 @@ impl PreviewGpu {
         assets: &mut PreviewAssetCache,
     ) -> Result<(), String> {
         let render_pass_key = render_pass_key.unwrap_or_else(|| "builtin_preview".to_string());
-        let render_pass_layout =
-            render_pass_layout.unwrap_or_else(|| self.builtin_render_pass.clone());
+        let (render_pass_layout, render_pass_was_provided) = match render_pass_layout {
+            Some(layout) => (layout, true),
+            None => (self.builtin_render_pass.clone(), false),
+        };
         self.ensure_pipeline(
             shader_label,
             shader_layout,
@@ -643,7 +645,7 @@ impl PreviewGpu {
         ) = target_snapshot;
         let (pipeline_handle, bind_group_layout, layout_hash, render_pass_handle, viewport) =
             pipeline_snapshot;
-        if render_pass_layout.is_some() {
+        if render_pass_was_provided || !resolved.bindless.is_empty() {
             self.update_bind_tables(shader_layout, resolved, mesh)?;
         }
         self.update_uniforms(config, light_dir, has_texture, target_size)?;
@@ -983,7 +985,7 @@ impl PreviewGpu {
             }
 
             let mut resource_sets: Vec<Vec<IndexedResource>> = Vec::new();
-            let mut bindings: Vec<IndexedBindingInfo<'_>> = Vec::new();
+            let mut binding_indices: Vec<(u32, usize)> = Vec::new();
 
             for (binding, group) in slots.iter().fold(
                 HashMap::<u32, Vec<&BindlessSlot>>::new(),
@@ -1009,8 +1011,7 @@ impl PreviewGpu {
                             })?;
                             ShaderResource::SampledImage(texture.view, self.sampler)
                         }
-                        BindGroupVariableType::StorageBuffer
-                        | BindGroupVariableType::DynamicStorage => {
+                        BindGroupVariableType::Storage | BindGroupVariableType::DynamicStorage => {
                             let handle = if slot.element == 0 {
                                 mesh.vertex_buffer
                             } else {
@@ -1034,17 +1035,19 @@ impl PreviewGpu {
                 }
 
                 resource_sets.push(resources);
-                let resources_ref = resource_sets.last().expect("resources just pushed");
-                bindings.push(IndexedBindingInfo {
-                    binding,
-                    resources: resources_ref,
-                });
+                let set_index = resource_sets.len() - 1;
+                binding_indices.push((binding, set_index));
             }
 
-            let update = BindTableUpdateInfo {
-                table,
-                bindings: &bindings,
-            };
+            let bindings: Vec<IndexedBindingInfo<'_>> = binding_indices
+                .iter()
+                .map(|(binding, set_index)| IndexedBindingInfo {
+                    binding: *binding,
+                    resources: &resource_sets[*set_index],
+                })
+                .collect();
+
+            let update = BindTableUpdateInfo { table, bindings: &bindings };
             self.ctx
                 .update_bind_table(&update)
                 .map_err(|err| format!("failed to update bind table: {err}"))?;
@@ -1160,7 +1163,7 @@ fn binding_type(
         .iter()
         .flat_map(|shader| shader.variables.iter())
         .find(|var| var.binding == binding)
-        .map(|var| var.var_type)
+        .map(|var| var.var_type.clone())
 }
 
 #[derive(Clone, PartialEq, Eq)]
